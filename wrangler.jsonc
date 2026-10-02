@@ -1,0 +1,19 @@
+{
+  "name": "proxy1",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-11",
+  "workers_dev": true,
+  "keep_vars": true,
+  "kv_namespaces": [
+    {
+      "binding": "ACCESS_CODES",
+      "id": "e0471db965c04cf0b66d19f6b38b5a4c"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "COMIC_CACHE",
+      "bucket_name": "planetahq-comics"
+    }
+  ]
+}
