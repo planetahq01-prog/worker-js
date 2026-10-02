@@ -821,7 +821,22 @@ async function handleDriveList(url, env) {
             attempts: 3,
             timeoutMs: 12e3
         });
-        return new Response(await res.text(), {
+        const responseBody = await res.text();
+        if (res.status === 403) {
+            let detail = { status: null, code: null, reasons: [], message: "" };
+            try {
+                const payload = JSON.parse(responseBody);
+                const error = payload && payload.error ? payload.error : payload;
+                detail.status = error.status || null;
+                detail.code = error.code || null;
+                detail.reasons = Array.isArray(error.errors) ? [...new Set(error.errors.map(item => item && item.reason).filter(Boolean))] : [];
+                detail.message = String(error.message || "").slice(0, 300);
+            } catch (_) {
+                detail.message = String(responseBody).slice(0, 200);
+            }
+            console.error("[PlanetaHQ] Drive list upstream 403", JSON.stringify(detail));
+        }
+        return new Response(responseBody, {
             status: res.status,
             headers: {
                 ...corsHeaders(),
