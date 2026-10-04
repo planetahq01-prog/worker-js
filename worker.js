@@ -26,6 +26,169 @@ function upstreamRetryDelay(response, attempt) {
     return Math.min(2500, 300 * 2 ** (attempt - 1) + Math.random() * 250);
 }
 
+const MEDIA_CHUNK_BYTES = 8 * 1024 * 1024;
+const MEDIA_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+
+function parseContentRangeHeader(value) {
+    const match = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(value || "");
+    if (!match || match[3] === "*") return null;
+    return { start: Number(match[1]), end: Number(match[2]), total: Number(match[3]) };
+}
+
+function concatChunks(chunks, total) {
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.byteLength; }
+    return out;
+}
+
+async function readBodyLimited(response, maxBytes) {
+    if (!response.body) return { bytes: new Uint8Array(0), response };
+    const declared = Number(response.headers.get("Content-Length"));
+    if (Number.isFinite(declared) && declared > maxBytes) return { bytes: null, response };
+    const reader = response.body.getReader();
+    const chunks = [];
+    let total = 0;
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+            try { reader.releaseLock(); } catch (_) {}
+            const bytes = concatChunks(chunks, total);
+            const bufferedResponse = new Response(bytes, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers
+            });
+            return { bytes, response: bufferedResponse };
+        }
+        const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+        if (total + chunk.byteLength > maxBytes) {
+            chunks.push(chunk);
+            total += chunk.byteLength;
+            let first = true;
+            const body = new ReadableStream({
+                async pull(controller) {
+                    if (first) {
+                        first = false;
+                        for (const part of chunks) controller.enqueue(part);
+                        return;
+                    }
+                    try {
+                        const next = await reader.read();
+                        if (next.done) { try { reader.releaseLock(); } catch (_) {} controller.close(); }
+                        else controller.enqueue(next.value);
+                    } catch (error) { controller.error(error); }
+                },
+                async cancel(reason) { try { await reader.cancel(reason); } catch (_) {} }
+            });
+            const passthrough = new Response(body, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers
+            });
+            return { bytes: null, response: passthrough };
+        }
+        chunks.push(chunk);
+        total += chunk.byteLength;
+    }
+}
+
+async function fetchUpstreamBufferedWithRetry(input, init = {}, options = {}) {
+    const attempts = options.attempts ?? 4;
+    const timeoutMs = options.timeoutMs ?? 25000;
+    const maxBufferBytes = options.maxBufferBytes ?? MEDIA_MAX_BUFFER_BYTES;
+    const externalSignal = init.signal;
+    const host = (() => { try { return new URL(input).hostname; } catch (_) { return "upstream"; } })();
+    let lastError;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        const controller = new AbortController();
+        const onExternalAbort = () => controller.abort();
+        if (externalSignal) {
+            if (externalSignal.aborted) controller.abort();
+            else externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+        }
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const response = await fetch(input, { ...init, signal: controller.signal });
+            let retry = UPSTREAM_RETRY_STATUSES.has(response.status);
+            if (response.status === 403) {
+                const body = await response.clone().text().catch(() => "");
+                retry = /rateLimitExceeded|userRateLimitExceeded|quotaExceeded/i.test(body);
+            }
+            if (retry && attempt < attempts) {
+                try { await response.body?.cancel(); } catch (_) {}
+                clearTimeout(timer);
+                if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
+                await sleepMs(upstreamRetryDelay(response, attempt));
+                continue;
+            }
+            if (!(response.ok || response.status === 206)) {
+                clearTimeout(timer);
+                if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
+                return { response, bytes: null };
+            }
+            const bodyResult = await readBodyLimited(response, maxBufferBytes);
+            clearTimeout(timer);
+            if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
+            return bodyResult;
+        } catch (error) {
+            lastError = error;
+            clearTimeout(timer);
+            if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
+            if (externalSignal?.aborted || attempt >= attempts) throw error;
+            console.warn("[PlanetaHQ Worker] upstream body/network retry", host, attempt, String(error?.message || error));
+            await sleepMs(upstreamRetryDelay(null, attempt));
+        }
+    }
+    throw lastError || new Error("Upstream indisponível após novas tentativas.");
+}
+
+function mediaResponseHeaders(contentType, contentLength, contentRange) {
+    const headers = new Headers(corsHeaders());
+    headers.set("Content-Type", contentType || "application/octet-stream");
+    headers.set("Accept-Ranges", "bytes");
+    headers.set("Cache-Control", "public, max-age=31536000, immutable");
+    if (contentLength != null) headers.set("Content-Length", String(contentLength));
+    if (contentRange) headers.set("Content-Range", contentRange);
+    return headers;
+}
+
+function createResilientFullMediaStream(firstBytes, firstRange, totalSize, driveUrl, contentType, signal) {
+    let offset = firstRange.end + 1;
+    let sendFirst = true;
+    return new ReadableStream({
+        async pull(controller) {
+            if (sendFirst) {
+                sendFirst = false;
+                controller.enqueue(firstBytes);
+                return;
+            }
+            if (offset >= totalSize) { controller.close(); return; }
+            const start = offset;
+            const end = Math.min(totalSize - 1, start + MEDIA_CHUNK_BYTES - 1);
+            try {
+                const result = await fetchUpstreamBufferedWithRetry(driveUrl, {
+                    headers: { Range: `bytes=${start}-${end}` },
+                    signal
+                }, { attempts: 4, timeoutMs: 25000, maxBufferBytes: MEDIA_MAX_BUFFER_BYTES });
+                if (!result.bytes || result.response.status !== 206) {
+                    try { await result.response?.body?.cancel(); } catch (_) {}
+                    throw new Error(`Google Drive não entregou o bloco ${start}-${end} como HTTP 206.`);
+                }
+                const actual = parseContentRangeHeader(result.response.headers.get("Content-Range"));
+                if (!actual || actual.start !== start || actual.total !== totalSize || actual.end < start || actual.end > end || result.bytes.byteLength !== actual.end - actual.start + 1) {
+                    throw new Error(`Bloco incompleto ou Content-Range inválido em ${start}-${end}.`);
+                }
+                offset = actual.end + 1;
+                controller.enqueue(result.bytes);
+            } catch (error) {
+                console.error("[PlanetaHQ Worker] mídia: bloco falhou após retries", JSON.stringify({ range: `${start}-${end}`, message: String(error?.message || error).slice(0, 220) }));
+                controller.error(error);
+            }
+        }
+    });
+}
+
 async function fetchUpstreamWithRetry(input, init = {}, options = {}) {
     const attempts = options.attempts ?? 3;
     const timeoutMs = options.timeoutMs ?? 2e4;
@@ -631,39 +794,70 @@ export default {
         const driveFetchHeaders = {};
         if (rangeHeader) driveFetchHeaders["Range"] = rangeHeader;
         let driveRes;
+        let bodyBytes = null;
         try {
-            driveRes = await fetchUpstreamWithRetry(driveUrl, {
-                headers: driveFetchHeaders
-            }, {
-                attempts: 3,
-                timeoutMs: 25e3
-            });
+            if (rangeHeader) {
+                // PDF.js usually requests small byte ranges. Buffer each range
+                // before replying so an upstream body reset can be retried
+                // without exposing a truncated 206 response to the browser.
+                const result = await fetchUpstreamBufferedWithRetry(driveUrl, {
+                    headers: { ...driveFetchHeaders, signal: request.signal }
+                }, { attempts: 4, timeoutMs: 25000, maxBufferBytes: MEDIA_MAX_BUFFER_BYTES });
+                driveRes = result.response;
+                bodyBytes = result.bytes;
+            } else {
+                // For complete downloads, fetch and validate one 8 MiB range
+                // first, then stream further ranges sequentially. This allows
+                // retries on mid-transfer resets without buffering a whole HQ
+                // in Worker memory or downloading a PDF before first render.
+                const firstEnd = MEDIA_CHUNK_BYTES - 1;
+                const result = await fetchUpstreamBufferedWithRetry(driveUrl, {
+                    headers: { Range: `bytes=0-${firstEnd}`, signal: request.signal }
+                }, { attempts: 4, timeoutMs: 25000, maxBufferBytes: MEDIA_MAX_BUFFER_BYTES });
+                driveRes = result.response;
+                bodyBytes = result.bytes;
+                if (driveRes.status === 206 && bodyBytes) {
+                    const firstRange = parseContentRangeHeader(driveRes.headers.get("Content-Range"));
+                    const contentType = driveRes.headers.get("Content-Type") || "application/octet-stream";
+                    if (firstRange && firstRange.start === 0 && firstRange.total > 0 && firstRange.end < firstRange.total && bodyBytes.byteLength === firstRange.end + 1) {
+                        const stream = createResilientFullMediaStream(bodyBytes, firstRange, firstRange.total, driveUrl, contentType, request.signal);
+                        return new Response(stream, {
+                            status: 200,
+                            headers: mediaResponseHeaders(contentType, firstRange.total)
+                        });
+                    }
+                    if (firstRange && firstRange.start === 0 && firstRange.total > 0 && firstRange.end === firstRange.total - 1 && bodyBytes.byteLength === firstRange.total) {
+                        return new Response(bodyBytes, {
+                            status: 200,
+                            headers: mediaResponseHeaders(contentType, firstRange.total)
+                        });
+                    }
+                    return new Response("Google Drive retornou um primeiro bloco inconsistente; tente novamente.", {
+                        status: 502,
+                        headers: { ...corsHeaders(), "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" }
+                    });
+                }
+            }
         } catch (e) {
-            console.error("[PlanetaHQ Worker] Drive media upstream failed after retries:", String(e?.message || e));
-            return new Response("Falha temporária ao acessar o Google Drive. Tente novamente.", {
+            console.error("[PlanetaHQ Worker] Drive media failed after body retries:", String(e?.message || e));
+            return new Response("Falha temporária ao acessar o Google Drive após repetir o bloco. Tente novamente.", {
                 status: 502,
-                headers: corsHeaders()
+                headers: { ...corsHeaders(), "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" }
             });
         }
-        if (!driveRes.ok && driveRes.status !== 206) {
-            const bodyText = await driveRes.text().catch(() => "");
+        if (!driveRes || (!driveRes.ok && driveRes.status !== 206)) {
+            const bodyText = await driveRes?.text().catch(() => "") || "Falha ao ler resposta do Google Drive.";
             return new Response(bodyText, {
-                status: driveRes.status,
-                headers: corsHeaders()
+                status: driveRes?.status || 502,
+                headers: { ...corsHeaders(), "Content-Type": driveRes?.headers.get("Content-Type") || "text/plain; charset=utf-8", "Cache-Control": "no-store" }
             });
         }
         const contentType = driveRes.headers.get("Content-Type") || "application/octet-stream";
         const contentLength = driveRes.headers.get("Content-Length");
         const contentRange = driveRes.headers.get("Content-Range");
-        const headers = {
-            ...corsHeaders(),
-            "Content-Type": contentType,
-            "Accept-Ranges": "bytes",
-            "Cache-Control": "public, max-age=31536000, immutable"
-        };
-        if (contentLength) headers["Content-Length"] = contentLength;
-        if (contentRange) headers["Content-Range"] = contentRange;
-        return new Response(driveRes.body, {
+        const headers = mediaResponseHeaders(contentType, contentLength, contentRange);
+        const responseBody = bodyBytes || driveRes.body;
+        return new Response(responseBody, {
             status: driveRes.status,
             headers: headers
         });
