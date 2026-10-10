@@ -4,7 +4,7 @@ const PARENT_Q_RE = /^'[A-Za-z0-9_-]{10,100}' in parents and trashed = false$/;
 
 const NAME_Q_RE = /^name contains '(?:[^'\\]|\\.)*' and trashed = false$/;
 
-const ADMIN_MODES = [ "list_cache", "purge_logos", "forget", "warm", "grant" ];
+const ADMIN_MODES = [ "list_cache", "purge_logos", "forget", "warm", "grant", "revoke_access" ];
 
 const MAX_COVER_BYTES = 3 * 1024 * 1024;
 
@@ -334,6 +334,16 @@ export default {
                     headers: corsHeaders()
                 });
             }
+        }
+        if (url.searchParams.get("revoke_access") === "1") {
+            const result = await revokeAccessByEmail(url.searchParams.get("email") || "", env);
+            return new Response(JSON.stringify(result), {
+                status: result.ok ? 200 : 400,
+                headers: {
+                    ...corsHeaders(),
+                    "Content-Type": "application/json"
+                }
+            });
         }
         if (url.searchParams.get("drive_list") === "1") {
             const denied = await requireAccessCode(url, env);
@@ -1151,6 +1161,53 @@ async function checkAndRegisterDevice(code, deviceId, deviceType, env, options =
     await env.ACCESS_CODES.put(key, JSON.stringify(data));
     return {
         valid: true
+    };
+}
+
+async function revokeAccessByEmail(rawEmail, env) {
+    const email = String(rawEmail || "").trim().toLowerCase();
+    if (!EMAIL_RE.test(email)) {
+        return { ok: false, error: "E-mail inválido." };
+    }
+
+    let deletedCodes = 0;
+    let emailMappingFound = false;
+    let cursor;
+
+    // Remove o vínculo direto e também varre os registros access:* para
+    // eliminar códigos órfãos que ainda tenham este e-mail associado.
+    const emailKey = `email:${email}`;
+    if (await env.ACCESS_CODES.get(emailKey)) emailMappingFound = true;
+    await env.ACCESS_CODES.delete(emailKey);
+
+    do {
+        const options = { prefix: "access:" };
+        if (cursor) options.cursor = cursor;
+        const page = await env.ACCESS_CODES.list(options);
+        for (const key of page.keys || []) {
+            const raw = await env.ACCESS_CODES.get(key.name);
+            if (!raw) continue;
+            try {
+                const data = JSON.parse(raw);
+                const storedEmail = String(data?.email || "").trim().toLowerCase();
+                if (storedEmail === email) {
+                    await env.ACCESS_CODES.delete(key.name);
+                    deletedCodes++;
+                }
+            } catch (_) {
+                // Ignora registros inválidos e não relacionados; a rota não
+                // deve falhar por causa de um registro corrompido diferente.
+            }
+        }
+        cursor = page.list_complete ? null : page.cursor;
+    } while (cursor);
+
+    return {
+        ok: true,
+        revoked: true,
+        email,
+        deletedCodes,
+        emailMappingFound
     };
 }
 
