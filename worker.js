@@ -1003,7 +1003,7 @@ async function handleDriveList(url, env) {
     }
     const params = new URLSearchParams({
         q: q,
-        fields: "nextPageToken, files(id,name,mimeType,size,modifiedTime,shortcutDetails,thumbnailLink)",
+        fields: "nextPageToken, files(id,name,mimeType,size,createdTime,modifiedTime,shortcutDetails,thumbnailLink)",
         pageSize: "1000",
         supportsAllDrives: "true",
         includeItemsFromAllDrives: "true",
