@@ -258,6 +258,40 @@ export default {
         if (request.method === "POST" && url.pathname === "/gg-webhook") {
             return handleGgWebhook(request, env);
         }
+
+        if (url.pathname === "/admin/search") {
+            const denied = requireAdminToken(request, env);
+            if (denied) return denied;
+            const searchUrl = new URL("https://admin.local/");
+            searchUrl.searchParams.set("q", url.searchParams.get("q") || "");
+            if (url.searchParams.has("pageToken")) searchUrl.searchParams.set("pageToken", url.searchParams.get("pageToken"));
+            return handleDriveList(searchUrl, env);
+        }
+        if (url.pathname === "/admin/cover-image") {
+            const denied = requireAdminToken(request, env);
+            if (denied) return denied;
+            const id = url.searchParams.get("id") || "";
+            if (!ID_RE.test(id)) return new Response("ID inválido.", { status: 400, headers: corsHeaders() });
+            const obj = await env.COMIC_CACHE.get(`detail-cover/${id}`);
+            if (!obj) return new Response("Capa personalizada não encontrada.", { status: 404, headers: corsHeaders() });
+            const headers = new Headers(corsHeaders());
+            headers.set("Content-Type", obj.httpMetadata?.contentType || "image/jpeg");
+            headers.set("Cache-Control", "no-store");
+            return new Response(obj.body, { headers });
+        }
+        if (url.pathname === "/admin/metadata") {
+            const denied = requireAdminToken(request, env);
+            if (denied) return denied;
+            return handleAdminMetadata(request, url, env);
+        }
+        if (url.pathname === "/admin/cover") {
+            const denied = requireAdminToken(request, env);
+            if (denied) return denied;
+            return handleAdminCover(request, url, env);
+        }
+        if (url.searchParams.get("detail_metadata") === "1") {
+            return handlePublicDetailMetadata(env);
+        }
         if (url.searchParams.get("auth_check") === "1") {
             const code = normalizeCode(url.searchParams.get("code") || "");
             const deviceId = (url.searchParams.get("device") || "").slice(0, 100);
@@ -548,6 +582,16 @@ export default {
         if (url.searchParams.get("warm") !== "1" && !hasValidAdminToken) {
             const denied = await requireAccessCode(url, env);
             if (denied) return denied;
+        }
+        if (url.searchParams.get("detail_cover") === "1") {
+            try {
+                const obj = await env.COMIC_CACHE.get(`detail-cover/${fileId}`);
+                if (!obj) return new Response("Capa personalizada não encontrada.", { status: 404, headers: corsHeaders() });
+                const headers = new Headers(corsHeaders());
+                headers.set("Content-Type", obj.httpMetadata?.contentType || "image/jpeg");
+                headers.set("Cache-Control", "no-store");
+                return new Response(obj.body, { headers });
+            } catch (e) { return new Response("Falha ao buscar a capa.", { status: 500, headers: corsHeaders() }); }
         }
         const rangeHeader = request.headers.get("Range");
         const cacheKey = `drive/${fileId}`;
@@ -928,10 +972,68 @@ async function putStreamToR2(bucket, key, stream, contentType) {
     }
 }
 
+function requireAdminToken(request, env) {
+    const json = (status, error) => new Response(JSON.stringify({ error }), { status, headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    if (!env.ADMIN_TOKEN) return json(503, "ADMIN_TOKEN não está configurado como segredo no Worker.");
+    const given = request.headers.get("X-Admin-Token") || "";
+    if (!given || !safeEqual(given, env.ADMIN_TOKEN)) return json(401, "ADMIN_TOKEN incorreto ou ausente.");
+    return null;
+}
+async function handlePublicDetailMetadata(env) {
+    try {
+        const items = {};
+        let cursor;
+        do {
+            const listing = await env.ACCESS_CODES.list({ prefix: "detail-meta:", limit: 1000, cursor });
+            for (const key of listing.keys) {
+                const id = key.name.slice("detail-meta:".length);
+                const value = await env.ACCESS_CODES.get(key.name);
+                if (value) { try { items[id] = JSON.parse(value); } catch (_) {} }
+            }
+            cursor = listing.list_complete ? undefined : listing.cursor;
+        } while (cursor);
+        return new Response(JSON.stringify({ items }), { headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    } catch (_) { return new Response(JSON.stringify({ items: {} }), { headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } }); }
+}
+async function handleAdminMetadata(request, url, env) {
+    const json = (status, data) => new Response(JSON.stringify(data), { status, headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    if (request.method === "GET") return handlePublicDetailMetadata(env);
+    if (request.method === "DELETE") {
+        const id = url.searchParams.get("id") || "";
+        if (!ID_RE.test(id)) return json(400, { error: "ID inválido." });
+        await env.ACCESS_CODES.delete(`detail-meta:${id}`);
+        await env.COMIC_CACHE.delete(`detail-cover/${id}`);
+        return json(200, { deleted: true });
+    }
+    if (request.method !== "PUT") return json(405, { error: "Método não permitido." });
+    let body; try { body = await request.json(); } catch (_) { return json(400, { error: "JSON inválido." }); }
+    const id = String(body.id || "");
+    if (!ID_RE.test(id) || !body.metadata || typeof body.metadata !== "object" || Array.isArray(body.metadata)) return json(400, { error: "Dados inválidos." });
+    const m = body.metadata;
+    const clean = { displayTitle: String(m.displayTitle || m.title || "").slice(0, 240), author: String(m.author || "").slice(0, 500), publicationDate: String(m.publicationDate || "").slice(0, 100), genres: Array.isArray(m.genres) ? m.genres.slice(0, 20).map(x => String(x).slice(0, 60)) : [], synopsis: String(m.synopsis || "").slice(0, 5000) };
+    if (m.coverId && ID_RE.test(String(m.coverId))) clean.coverId = String(m.coverId);
+    await env.ACCESS_CODES.put(`detail-meta:${id}`, JSON.stringify(clean));
+    return json(200, { saved: true, id });
+}
+async function handleAdminCover(request, url, env) {
+    const json = (status, data) => new Response(JSON.stringify(data), { status, headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    if (request.method !== "PUT") return json(405, { error: "Método não permitido." });
+    const id = url.searchParams.get("id") || "";
+    const type = (request.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
+    if (!ID_RE.test(id)) return json(400, { error: "ID inválido." });
+    if (!["image/jpeg", "image/png", "image/webp"].includes(type)) return json(415, { error: "Formato de imagem não permitido." });
+    const declared = Number(request.headers.get("Content-Length") || 0);
+    if (!declared || declared > MAX_COVER_BYTES) return json(413, { error: "A capa deve ter até 3 MB." });
+    const bytes = await request.arrayBuffer();
+    if (!bytes.byteLength || bytes.byteLength > MAX_COVER_BYTES) return json(413, { error: "Tamanho de imagem inválido." });
+    await env.COMIC_CACHE.put(`detail-cover/${id}`, bytes, { httpMetadata: { contentType: type } });
+    return json(200, { saved: true, id });
+}
+
 function corsHeaders() {
     return {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, HEAD, PUT, OPTIONS",
+        "Access-Control-Allow-Methods": "GET, HEAD, PUT, DELETE, OPTIONS",
         "Access-Control-Allow-Headers": "Range, Content-Type, X-Admin-Token",
         "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges"
     };
