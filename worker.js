@@ -262,10 +262,7 @@ export default {
         if (url.pathname === "/admin/search") {
             const denied = requireAdminToken(request, env);
             if (denied) return denied;
-            const searchUrl = new URL("https://admin.local/");
-            searchUrl.searchParams.set("q", url.searchParams.get("q") || "");
-            if (url.searchParams.has("pageToken")) searchUrl.searchParams.set("pageToken", url.searchParams.get("pageToken"));
-            return handleDriveList(searchUrl, env);
+            return handleAdminCatalogSearch(url, env);
         }
         if (url.pathname === "/admin/cover-image") {
             const denied = requireAdminToken(request, env);
@@ -994,6 +991,72 @@ async function handlePublicDetailMetadata(env) {
         } while (cursor);
         return new Response(JSON.stringify({ items }), { headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
     } catch (_) { return new Response(JSON.stringify({ items: {} }), { headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } }); }
+}
+async function handleAdminCatalogSearch(url, env) {
+    const json = (status, data) => new Response(JSON.stringify(data), { status, headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    const term = String(url.searchParams.get("q") || "").trim();
+    if (term.length < 2 || term.length > 120) return json(400, { error: "Digite de 2 a 120 caracteres para pesquisar." });
+    if (!env.DRIVE_API_KEY) return json(500, { error: "DRIVE_API_KEY não configurada no Worker." });
+
+    // Limita a busca à mesma raiz pública usada pelo app; não consulta o Drive inteiro.
+    const rootId = "11JGPcNE-t4R4G8NaefyATXW3cWeu2n8Y";
+    const queue = [rootId];
+    const seen = new Set(queue);
+    const matches = [];
+    const needle = term.toLocaleLowerCase();
+    const maxFolders = 40;
+    const batchSize = 5;
+    let checkedFolders = 0;
+    let blockedFolders = 0;
+    let pageTruncated = false;
+    const folderMime = "application/vnd.google-apps.folder";
+    const comicName = /\.(pdf|cbz|cbr)$/i;
+
+    while (queue.length && checkedFolders < maxFolders) {
+        const batch = queue.splice(0, Math.min(batchSize, maxFolders - checkedFolders));
+        checkedFolders += batch.length;
+        const results = await Promise.all(batch.map(async folderId => {
+            const files = [];
+            let pageToken = "";
+            for (let page = 0; page < 2; page++) {
+                const listUrl = new URL("https://admin.local/");
+                listUrl.searchParams.set("q", `'${folderId}' in parents and trashed = false`);
+                if (pageToken) listUrl.searchParams.set("pageToken", pageToken);
+                const response = await handleDriveList(listUrl, env);
+                let payload;
+                try { payload = await response.json(); } catch (_) { payload = { error: "Resposta inválida do Google Drive." }; }
+                if (!response.ok) return { error: payload, status: response.status, folderId };
+                files.push(...(Array.isArray(payload.files) ? payload.files : []));
+                if (!payload.nextPageToken) return { files, folderId };
+                pageToken = payload.nextPageToken;
+                if (page === 1) pageTruncated = true;
+            }
+            return { files, folderId };
+        }));
+
+        for (const result of results) {
+            if (result.error) {
+                if (result.folderId === rootId) return json(result.status, result.error);
+                blockedFolders++;
+                continue;
+            }
+            for (const file of result.files) {
+                const name = String(file.name || "");
+                const mime = String(file.mimeType || "");
+                if ((mime === folderMime || comicName.test(name)) && name.toLocaleLowerCase().includes(needle)) {
+                    matches.push(file);
+                    if (matches.length >= 200) break;
+                }
+                if (mime === folderMime && file.id && !seen.has(file.id)) {
+                    seen.add(file.id);
+                    queue.push(file.id);
+                }
+            }
+        }
+        if (matches.length >= 200) break;
+    }
+    const partial = queue.length > 0 || checkedFolders >= maxFolders || pageTruncated || blockedFolders > 0;
+    return json(200, { files: matches, partial, blockedFolders, scannedFolders: checkedFolders });
 }
 async function handleAdminMetadata(request, url, env) {
     const json = (status, data) => new Response(JSON.stringify(data), { status, headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
