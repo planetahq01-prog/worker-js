@@ -998,65 +998,90 @@ async function handleAdminCatalogSearch(url, env) {
     if (term.length < 2 || term.length > 120) return json(400, { error: "Digite de 2 a 120 caracteres para pesquisar." });
     if (!env.DRIVE_API_KEY) return json(500, { error: "DRIVE_API_KEY não configurada no Worker." });
 
-    // Limita a busca à mesma raiz pública usada pelo app; não consulta o Drive inteiro.
     const rootId = "11JGPcNE-t4R4G8NaefyATXW3cWeu2n8Y";
-    const queue = [rootId];
-    const seen = new Set(queue);
-    const matches = [];
-    const needle = term.toLocaleLowerCase();
-    const maxFolders = 40;
+    const cursor = String(url.searchParams.get("cursor") || "");
+    let scanId = cursor;
+    let state;
+    if (cursor) {
+        if (!/^[0-9a-f-]{36}$/i.test(cursor)) return json(400, { error: "Cursor de busca inválido." });
+        const saved = await env.ACCESS_CODES.get(`admin-search:${cursor}`);
+        if (!saved) return json(410, { error: "A busca expirou. Inicie a pesquisa novamente." });
+        try { state = JSON.parse(saved); } catch (_) { return json(410, { error: "O estado da busca expirou. Inicie novamente." }); }
+        if (state.term !== term) return json(400, { error: "O cursor não corresponde a esta pesquisa." });
+    } else {
+        scanId = crypto.randomUUID();
+        state = { term, queue: [{ folderId: rootId, pageToken: "" }], seenFolders: [rootId], matchedIds: [], blockedFolders: 0, scannedRequests: 0, truncated: false };
+    }
+
+    const queue = Array.isArray(state.queue) ? state.queue : [];
+    const seenFolders = new Set(Array.isArray(state.seenFolders) ? state.seenFolders : [rootId]);
+    const matchedIds = new Set(Array.isArray(state.matchedIds) ? state.matchedIds : []);
+    const newFiles = [];
+    const norm = value => String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLocaleLowerCase();
+    const needle = norm(term);
+    const maxRequestsPerCall = 40;
     const batchSize = 5;
-    let checkedFolders = 0;
-    let blockedFolders = 0;
-    let pageTruncated = false;
+    const maxResults = 500;
     const folderMime = "application/vnd.google-apps.folder";
     const comicName = /\.(pdf|cbz|cbr)$/i;
+    let requestsThisCall = 0;
 
-    while (queue.length && checkedFolders < maxFolders) {
-        const batch = queue.splice(0, Math.min(batchSize, maxFolders - checkedFolders));
-        checkedFolders += batch.length;
-        const results = await Promise.all(batch.map(async folderId => {
-            const files = [];
-            let pageToken = "";
-            for (let page = 0; page < 2; page++) {
-                const listUrl = new URL("https://admin.local/");
-                listUrl.searchParams.set("q", `'${folderId}' in parents and trashed = false`);
-                if (pageToken) listUrl.searchParams.set("pageToken", pageToken);
-                const response = await handleDriveList(listUrl, env);
-                let payload;
-                try { payload = await response.json(); } catch (_) { payload = { error: "Resposta inválida do Google Drive." }; }
-                if (!response.ok) return { error: payload, status: response.status, folderId };
-                files.push(...(Array.isArray(payload.files) ? payload.files : []));
-                if (!payload.nextPageToken) return { files, folderId };
-                pageToken = payload.nextPageToken;
-                if (page === 1) pageTruncated = true;
-            }
-            return { files, folderId };
+    while (queue.length && requestsThisCall < maxRequestsPerCall && matchedIds.size < maxResults) {
+        const batch = queue.splice(0, Math.min(batchSize, maxRequestsPerCall - requestsThisCall));
+        requestsThisCall += batch.length;
+        state.scannedRequests += batch.length;
+        const results = await Promise.all(batch.map(async task => {
+            const folderId = String(task.folderId || "");
+            const listUrl = new URL("https://admin.local/");
+            listUrl.searchParams.set("q", `'${folderId}' in parents and trashed = false`);
+            if (task.pageToken) listUrl.searchParams.set("pageToken", task.pageToken);
+            const response = await handleDriveList(listUrl, env);
+            let payload;
+            try { payload = await response.json(); } catch (_) { payload = { error: "Resposta inválida do Google Drive." }; }
+            return { folderId, response, payload };
         }));
 
         for (const result of results) {
-            if (result.error) {
-                if (result.folderId === rootId) return json(result.status, result.error);
-                blockedFolders++;
+            if (!result.response.ok) {
+                if (result.folderId === rootId) return json(result.response.status, result.payload);
+                state.blockedFolders = (Number(state.blockedFolders) || 0) + 1;
                 continue;
             }
-            for (const file of result.files) {
+            if (result.payload.nextPageToken) queue.push({ folderId: result.folderId, pageToken: result.payload.nextPageToken });
+            for (const file of Array.isArray(result.payload.files) ? result.payload.files : []) {
                 const name = String(file.name || "");
                 const mime = String(file.mimeType || "");
-                if ((mime === folderMime || comicName.test(name)) && name.toLocaleLowerCase().includes(needle)) {
-                    matches.push(file);
-                    if (matches.length >= 200) break;
+                if ((mime === folderMime || comicName.test(name)) && norm(name).includes(needle) && file.id && !matchedIds.has(file.id)) {
+                    matchedIds.add(file.id);
+                    newFiles.push(file);
+                    if (matchedIds.size >= maxResults) { state.truncated = true; queue.length = 0; break; }
                 }
-                if (mime === folderMime && file.id && !seen.has(file.id)) {
-                    seen.add(file.id);
-                    queue.push(file.id);
+                if (mime === folderMime && file.id && !seenFolders.has(file.id)) {
+                    seenFolders.add(file.id);
+                    queue.push({ folderId: file.id, pageToken: "" });
                 }
             }
         }
-        if (matches.length >= 200) break;
     }
-    const partial = queue.length > 0 || checkedFolders >= maxFolders || pageTruncated || blockedFolders > 0;
-    return json(200, { files: matches, partial, blockedFolders, scannedFolders: checkedFolders });
+
+    state.queue = queue;
+    state.seenFolders = [...seenFolders];
+    state.matchedIds = [...matchedIds];
+    const hasMore = queue.length > 0 && !state.truncated;
+    if (hasMore) {
+        await env.ACCESS_CODES.put(`admin-search:${scanId}`, JSON.stringify(state), { expirationTtl: 600 });
+    } else if (cursor) {
+        await env.ACCESS_CODES.delete(`admin-search:${scanId}`);
+    }
+    return json(200, {
+        files: newFiles,
+        cursor: hasMore ? scanId : "",
+        partial: !!state.blockedFolders || !!state.truncated,
+        blockedFolders: Number(state.blockedFolders) || 0,
+        scannedFolders: Number(state.scannedRequests) || 0,
+        truncated: !!state.truncated,
+        done: !hasMore
+    });
 }
 async function handleAdminMetadata(request, url, env) {
     const json = (status, data) => new Response(JSON.stringify(data), { status, headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
