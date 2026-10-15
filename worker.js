@@ -4,7 +4,7 @@ const PARENT_Q_RE = /^'[A-Za-z0-9_-]{10,100}' in parents and trashed = false$/;
 
 const NAME_Q_RE = /^name contains '(?:[^'\\]|\\.)*' and trashed = false$/;
 
-const ADMIN_MODES = [ "list_cache", "purge_logos", "forget", "warm", "grant", "revoke_access" ];
+const ADMIN_MODES = [ "list_cache", "purge_logos", "forget", "warm", "grant", "revoke_access", "revoke_code" ];
 
 const MAX_COVER_BYTES = 3 * 1024 * 1024;
 
@@ -368,6 +368,20 @@ export default {
         }
         if (url.searchParams.get("revoke_access") === "1") {
             const result = await revokeAccessByEmail(url.searchParams.get("email") || "", env);
+            return new Response(JSON.stringify(result), {
+                status: result.ok ? 200 : 400,
+                headers: {
+                    ...corsHeaders(),
+                    "Content-Type": "application/json"
+                }
+            });
+        }
+        if (url.searchParams.get("revoke_code") === "1") {
+            let body = {};
+            if (request.method === "POST") {
+                try { body = await request.json(); } catch (_) {}
+            }
+            const result = await revokeAccessByCode(body.code || url.searchParams.get("code") || "", env);
             return new Response(JSON.stringify(result), {
                 status: result.ok ? 200 : 400,
                 headers: {
@@ -1352,6 +1366,38 @@ async function checkAndRegisterDevice(code, deviceId, deviceType, env, options =
     return {
         valid: true
     };
+}
+
+async function revokeAccessByCode(rawCode, env) {
+    const code = normalizeCode(rawCode);
+    if (!/^[A-Z0-9]{8}$/.test(code)) {
+        return { ok: false, error: "Código inválido: informe o código completo de 8 caracteres." };
+    }
+    const accessKey = `access:${code}`;
+    const existing = await env.ACCESS_CODES.get(accessKey);
+    if (!existing) {
+        return { ok: true, revoked: false, notFound: true, deletedEmailMappings: 0 };
+    }
+    await env.ACCESS_CODES.delete(accessKey);
+
+    // Remove apenas vínculos email:* que apontem para este código específico.
+    let deletedEmailMappings = 0;
+    let cursor;
+    do {
+        const options = { prefix: "email:" };
+        if (cursor) options.cursor = cursor;
+        const page = await env.ACCESS_CODES.list(options);
+        for (const key of page.keys || []) {
+            const mappedCode = await env.ACCESS_CODES.get(key.name);
+            if (mappedCode && normalizeCode(mappedCode) === code) {
+                await env.ACCESS_CODES.delete(key.name);
+                deletedEmailMappings++;
+            }
+        }
+        cursor = page.list_complete ? null : page.cursor;
+    } while (cursor);
+
+    return { ok: true, revoked: true, notFound: false, deletedEmailMappings };
 }
 
 async function revokeAccessByEmail(rawEmail, env) {
