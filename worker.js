@@ -7,6 +7,15 @@ const NAME_Q_RE = /^name contains '(?:[^'\\]|\\.)*' and trashed = false$/;
 const ADMIN_MODES = [ "list_cache", "purge_logos", "forget", "warm", "grant", "revoke_access", "revoke_code" ];
 
 const MAX_COVER_BYTES = 3 * 1024 * 1024;
+const MAX_CATALOG_BYTES = 25 * 1024 * 1024;
+const R2_CATALOG_KEY = "catalog/index.json";
+const R2_CATALOG_MODE_KEY = "catalog/mode.json";
+const R2_CATALOG_UPDATE_PREFIX = "catalog/updates/";
+const R2_CATALOG_ROOT_ID = "11JGPcNE-t4R4G8NaefyATXW3cWeu2n8Y";
+const R2_CATALOG_CACHE_TTL_MS = 30000;
+let r2CatalogMemo = { expiresAt: 0, value: null, loaded: false };
+let r2OnlyMemo = { expiresAt: 0, value: false, loaded: false };
+const driveMetadataMemo = new Map();
 
 const COVER_TYPES = [ "image/jpeg", "image/png", "image/webp" ];
 
@@ -259,6 +268,21 @@ export default {
             return handleGgWebhook(request, env);
         }
 
+        if (url.pathname === "/admin/catalog") {
+            const denied = requireAdminToken(request, env);
+            if (denied) return denied;
+            return handleAdminCatalogUpload(request, env);
+        }
+        if (url.pathname === "/admin/catalog-mode") {
+            const denied = requireAdminToken(request, env);
+            if (denied) return denied;
+            return handleAdminCatalogMode(request, env);
+        }
+        if (url.pathname === "/admin/catalog-coverage") {
+            const denied = requireAdminToken(request, env);
+            if (denied) return denied;
+            return handleAdminCatalogCoverage(env);
+        }
         if (url.pathname === "/admin/search") {
             const denied = requireAdminToken(request, env);
             if (denied) return denied;
@@ -753,66 +777,61 @@ export default {
                 });
             }
         }
+        // Importação administrativa explícita: o aquecedor privado, validado
+        // por ADMIN_TOKEN acima, ainda pode copiar Drive -> R2 em modo r2-only.
+        // As requisições normais do app não passam por este ramo e continuam
+        // sem fallback ao Drive quando r2-only está ativo.
         if (url.searchParams.get("warm") === "1") {
+            if (!env.DRIVE_API_KEY) {
+                return new Response("DRIVE_API_KEY não configurada no Worker.", { status: 500, headers: corsHeaders() });
+            }
             try {
-                const already = await env.COMIC_CACHE.head(cacheKey);
-                if (already) {
-                    return new Response(JSON.stringify({
-                        cached: true,
-                        alreadyCached: true
-                    }), {
-                        headers: {
-                            ...corsHeaders(),
-                            "Content-Type": "application/json"
-                        }
+                const requestedItem = await getDriveMetadataForCatalog(fileId, env);
+                let mediaItem = requestedItem;
+                const metadataItems = [requestedItem];
+                if (requestedItem.mimeType === "application/vnd.google-apps.shortcut") {
+                    const targetId = requestedItem.shortcutDetails?.targetId;
+                    if (!targetId) throw new Error("O atalho não informa targetId.");
+                    mediaItem = await getDriveMetadataForCatalog(targetId, env);
+                    metadataItems.push(mediaItem);
+                }
+                const isFolder = requestedItem.mimeType === "application/vnd.google-apps.folder" || mediaItem.mimeType === "application/vnd.google-apps.folder";
+                const metadataState = await collectCatalogMetadata(env, metadataItems);
+                if (isFolder) {
+                    const indexedRecords = await persistCatalogMetadataUpdates(env, metadataState);
+                    return new Response(JSON.stringify({ cached: false, indexed: true, isFolder: true, id: requestedItem.id, indexedRecords }), {
+                        headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" }
                     });
                 }
-            } catch (e) {}
-            if (!env.DRIVE_API_KEY) {
-                return new Response("DRIVE_API_KEY não configurada no Worker.", {
-                    status: 500,
-                    headers: corsHeaders()
-                });
-            }
-            const driveUrl = driveMediaUrl(fileId, env);
-            try {
-                const driveRes = await fetchUpstreamWithRetry(driveUrl, {}, {
-                    attempts: 3,
-                    timeoutMs: 25e3
-                });
+                const mediaId = mediaItem.id;
+                if (!ID_RE.test(String(mediaId || ""))) throw new Error("ID real do arquivo inválido.");
+                const warmCacheKey = `drive/${mediaId}`;
+                const already = await env.COMIC_CACHE.head(warmCacheKey);
+                if (already) {
+                    const indexedRecords = await persistCatalogMetadataUpdates(env, metadataState);
+                    return new Response(JSON.stringify({ cached: true, alreadyCached: true, indexed: true, id: mediaId, indexedRecords }), {
+                        headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" }
+                    });
+                }
+                const driveUrl = driveMediaUrl(mediaId, env);
+                const driveRes = await fetchUpstreamWithRetry(driveUrl, {}, { attempts: 3, timeoutMs: 25e3 });
                 if (!driveRes.ok) {
                     const bodyText = await driveRes.text().catch(() => "");
-                    return new Response(JSON.stringify({
-                        cached: false,
-                        error: bodyText || `HTTP ${driveRes.status}`
-                    }), {
+                    return new Response(JSON.stringify({ cached: false, indexed: false, error: bodyText || `HTTP ${driveRes.status}` }), {
                         status: driveRes.status,
-                        headers: {
-                            ...corsHeaders(),
-                            "Content-Type": "application/json"
-                        }
+                        headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" }
                     });
                 }
                 const contentType = driveRes.headers.get("Content-Type") || "application/octet-stream";
-                await putStreamToR2(env.COMIC_CACHE, cacheKey, driveRes.body, contentType);
-                return new Response(JSON.stringify({
-                    cached: true
-                }), {
-                    headers: {
-                        ...corsHeaders(),
-                        "Content-Type": "application/json"
-                    }
+                await putStreamToR2(env.COMIC_CACHE, warmCacheKey, driveRes.body, contentType);
+                const indexedRecords = await persistCatalogMetadataUpdates(env, metadataState);
+                return new Response(JSON.stringify({ cached: true, indexed: true, id: mediaId, indexedRecords }), {
+                    headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" }
                 });
             } catch (e) {
-                return new Response(JSON.stringify({
-                    cached: false,
-                    error: String(e)
-                }), {
+                return new Response(JSON.stringify({ cached: false, indexed: false, error: String(e?.message || e) }), {
                     status: 502,
-                    headers: {
-                        ...corsHeaders(),
-                        "Content-Type": "application/json"
-                    }
+                    headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" }
                 });
             }
         }
@@ -849,6 +868,12 @@ export default {
                 return objectToResponse(obj, !!rangeHeader);
             }
         } catch (e) {}
+        if (await isR2OnlyMode(env)) {
+            return new Response(JSON.stringify({ error: "not_found_in_r2", message: "Este arquivo não está armazenado no R2." }), {
+                status: 404,
+                headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" }
+            });
+        }
         if (!env.DRIVE_API_KEY) {
             return new Response("DRIVE_API_KEY não configurada no Worker.", {
                 status: 500,
@@ -1010,7 +1035,6 @@ async function handleAdminCatalogSearch(url, env) {
     const json = (status, data) => new Response(JSON.stringify(data), { status, headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
     const term = String(url.searchParams.get("q") || "").trim();
     if (term.length < 2 || term.length > 120) return json(400, { error: "Digite de 2 a 120 caracteres para pesquisar." });
-    if (!env.DRIVE_API_KEY) return json(500, { error: "DRIVE_API_KEY não configurada no Worker." });
 
     const rootId = "11JGPcNE-t4R4G8NaefyATXW3cWeu2n8Y";
     const cursor = String(url.searchParams.get("cursor") || "");
@@ -1191,7 +1215,270 @@ function driveMediaUrl(fileId, env) {
     return `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&key=${encodeURIComponent(env.DRIVE_API_KEY)}`;
 }
 
+async function getR2Catalog(env) {
+    const now = Date.now();
+    if (r2CatalogMemo.loaded && now < r2CatalogMemo.expiresAt) return r2CatalogMemo.value;
+    const obj = await env.COMIC_CACHE.get(R2_CATALOG_KEY);
+    if (!obj) {
+        r2CatalogMemo = { expiresAt: now + 5000, value: null, loaded: true };
+        return null;
+    }
+    let manifest;
+    try { manifest = JSON.parse(await obj.text()); }
+    catch (e) { throw new Error("O índice catalog/index.json no R2 não é um JSON válido."); }
+    if (!manifest || manifest.schemaVersion !== 1 || !Array.isArray(manifest.items) || !manifest.rootId) {
+        throw new Error("Formato do índice R2 inválido; esperado schemaVersion 1 e items[].");
+    }
+    const byId = new Map();
+    const byParent = new Map();
+    for (const item of manifest.items) {
+        if (!item || typeof item.id !== "string" || !item.id || typeof item.name !== "string") continue;
+        byId.set(item.id, item);
+        for (const parentId of Array.isArray(item.parents) ? item.parents : []) {
+            if (!byParent.has(parentId)) byParent.set(parentId, []);
+            byParent.get(parentId).push(item);
+        }
+    }
+    const value = { manifest, byId, byParent, allItems: Array.from(byId.values()) };
+    r2CatalogMemo = { expiresAt: now + R2_CATALOG_CACHE_TTL_MS, value, loaded: true };
+    return value;
+}
+
+async function isR2OnlyMode(env) {
+    const now = Date.now();
+    if (r2OnlyMemo.loaded && now < r2OnlyMemo.expiresAt) return r2OnlyMemo.value;
+    let mode = "r2-first";
+    try {
+        const obj = await env.COMIC_CACHE.get(R2_CATALOG_MODE_KEY);
+        if (obj) {
+            const data = JSON.parse(await obj.text());
+            if (data && data.mode === "r2-only") mode = "r2-only";
+        }
+    } catch (_) {}
+    const value = mode === "r2-only";
+    r2OnlyMemo = { expiresAt: now + 5000, value, loaded: true };
+    return value;
+}
+
+async function getDriveMetadataForCatalog(fileId, env) {
+    if (!ID_RE.test(String(fileId || ""))) throw new Error("ID do Drive inválido ao sincronizar o catálogo.");
+    if (!env.DRIVE_API_KEY) throw new Error("DRIVE_API_KEY não configurada; não foi possível sincronizar os metadados.");
+    const now = Date.now();
+    const cached = driveMetadataMemo.get(fileId);
+    if (cached && now < cached.expiresAt) return cached.promise;
+    const params = new URLSearchParams({
+        fields: "id,name,mimeType,size,createdTime,modifiedTime,shortcutDetails,thumbnailLink,parents",
+        supportsAllDrives: "true",
+        key: env.DRIVE_API_KEY
+    });
+    const promise = fetchUpstreamWithRetry(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?${params.toString()}`, {}, { attempts: 3, timeoutMs: 12000 }).then(async res => {
+        if (!res.ok) throw new Error(`Drive metadata HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 240)}`);
+        const item = await res.json();
+        if (!item || item.id !== fileId || !item.name || !item.mimeType) throw new Error("Resposta de metadados do Drive incompleta.");
+        return item;
+    });
+    driveMetadataMemo.set(fileId, { expiresAt: now + 60000, promise });
+    try { return await promise; }
+    catch (e) { driveMetadataMemo.delete(fileId); throw e; }
+}
+
+async function collectCatalogMetadata(env, startingItems) {
+    const catalog = await getR2Catalog(env);
+    const records = new Map();
+    const visited = new Set();
+    async function walk(item, depth) {
+        if (!item || !item.id || depth > 20 || visited.has(item.id)) return;
+        visited.add(item.id);
+        records.set(item.id, item);
+        for (const parentId of Array.isArray(item.parents) ? item.parents : []) {
+            if (!ID_RE.test(parentId) || parentId === R2_CATALOG_ROOT_ID || catalog?.byId.has(parentId)) continue;
+            const parent = await getDriveMetadataForCatalog(parentId, env);
+            await walk(parent, depth + 1);
+        }
+    }
+    for (const item of startingItems) await walk(item, 0);
+    return { catalog, records: [...records.values()] };
+}
+
+async function persistCatalogMetadataUpdates(env, state) {
+    let saved = 0;
+    for (const item of state.records) {
+        if (!item || !item.id || state.catalog?.byId.has(item.id)) continue;
+        const parents = Array.isArray(item.parents) ? item.parents : [];
+        for (const parentId of parents) {
+            if (!ID_RE.test(parentId)) continue;
+            const key = `${R2_CATALOG_UPDATE_PREFIX}${parentId}/${item.id}.json`;
+            await env.COMIC_CACHE.put(key, JSON.stringify(item), { httpMetadata: { contentType: "application/json; charset=utf-8" } });
+            saved++;
+        }
+    }
+    return saved;
+}
+
+async function loadCatalogMetadataUpdates(env, parentId = null) {
+    const prefix = parentId ? `${R2_CATALOG_UPDATE_PREFIX}${parentId}/` : R2_CATALOG_UPDATE_PREFIX;
+    const byId = new Map();
+    let cursor;
+    do {
+        const page = await env.COMIC_CACHE.list({ prefix, limit: 1000, cursor });
+        const objects = page.objects || [];
+        for (let i = 0; i < objects.length; i += 40) {
+            const batch = objects.slice(i, i + 40);
+            const rows = await Promise.all(batch.map(async entry => {
+                const obj = await env.COMIC_CACHE.get(entry.key);
+                if (!obj) return null;
+                const item = JSON.parse(await obj.text());
+                return item && item.id && item.name ? item : null;
+            }));
+            for (const item of rows) if (item) byId.set(item.id, item);
+        }
+        cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    return [...byId.values()];
+}
+
+function catalogJson(status, data) {
+    return new Response(JSON.stringify(data), { status, headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
+}
+
+async function handleAdminCatalogUpload(request, env) {
+    if (request.method !== "PUT") return catalogJson(405, { error: "Use PUT para enviar o índice." });
+    const declared = Number(request.headers.get("Content-Length") || 0);
+    if (declared > MAX_CATALOG_BYTES) return catalogJson(413, { error: "Índice muito grande (limite 25 MB)." });
+    let bytes;
+    try { bytes = await request.arrayBuffer(); }
+    catch (_) { return catalogJson(400, { error: "Não foi possível ler o arquivo enviado." }); }
+    if (!bytes.byteLength || bytes.byteLength > MAX_CATALOG_BYTES) return catalogJson(413, { error: "Índice vazio ou acima do limite de 25 MB." });
+    let data;
+    try { data = JSON.parse(new TextDecoder().decode(bytes)); }
+    catch (_) { return catalogJson(400, { error: "O arquivo enviado não contém JSON válido." }); }
+    if (!data || data.schemaVersion !== 1 || !Array.isArray(data.items) || !data.rootId || data.items.length > 250000) {
+        return catalogJson(400, { error: "Formato inválido; esperado schemaVersion 1, rootId e items[]." });
+    }
+    try {
+        await env.COMIC_CACHE.put(R2_CATALOG_KEY, bytes, { httpMetadata: { contentType: "application/json; charset=utf-8" } });
+        r2CatalogMemo = { expiresAt: 0, value: null, loaded: false };
+        return catalogJson(200, { saved: true, key: R2_CATALOG_KEY, bytes: bytes.byteLength, items: data.items.length, generatedAt: data.generatedAt || null });
+    } catch (e) { return catalogJson(500, { error: "Falha ao salvar o índice no R2: " + String(e) }); }
+}
+
+async function handleAdminCatalogMode(request, env) {
+    if (request.method !== "PUT") return catalogJson(405, { error: "Use PUT para alterar o modo." });
+    let data;
+    try { data = await request.json(); }
+    catch (_) { return catalogJson(400, { error: "Envie JSON com mode: r2-first ou r2-only." }); }
+    if (!data || !["r2-first", "r2-only"].includes(data.mode)) return catalogJson(400, { error: "O modo deve ser r2-first ou r2-only." });
+    try {
+        const body = JSON.stringify({ mode: data.mode, updatedAt: new Date().toISOString() });
+        await env.COMIC_CACHE.put(R2_CATALOG_MODE_KEY, body, { httpMetadata: { contentType: "application/json; charset=utf-8" } });
+        r2OnlyMemo = { expiresAt: 0, value: data.mode === "r2-only", loaded: true };
+        return catalogJson(200, { saved: true, key: R2_CATALOG_MODE_KEY, mode: data.mode });
+    } catch (e) { return catalogJson(500, { error: "Falha ao salvar o modo no R2: " + String(e) }); }
+}
+
+function isReadableComicItem(item) {
+    if (!item) return false;
+    let mime = item.mimeType || "";
+    let id = item.id || "";
+    if (mime === "application/vnd.google-apps.folder") return false;
+    if (mime === "application/vnd.google-apps.shortcut") {
+        const detail = item.shortcutDetails || {};
+        mime = detail.targetMimeType || "";
+        id = detail.targetId || "";
+    }
+    const ext = /\.(pdf|cbz|cbr)$/i.exec(item.name || "");
+    const supportedMime = new Set(["application/pdf", "application/zip", "application/x-cbz", "application/vnd.comicbook+zip", "application/x-zip-compressed", "application/x-rar-compressed", "application/vnd.rar", "application/x-cbr", "application/vnd.comicbook-rar", "application/x-rar"]);
+    return !!id && (!!ext || supportedMime.has(mime));
+}
+
+async function handleAdminCatalogCoverage(env) {
+    const json = (status, data) => catalogJson(status, data);
+    let catalog;
+    try { catalog = await getR2Catalog(env); }
+    catch (e) { return json(500, { error: String(e) }); }
+    if (!catalog) return json(409, { error: "O índice catalog/index.json ainda não foi enviado ao R2." });
+    const effectiveItems = new Map(catalog.allItems.map(item => [item.id, item]));
+    try {
+        for (const item of await loadCatalogMetadataUpdates(env)) effectiveItems.set(item.id, item);
+    } catch (e) { return json(500, { error: "Falha ao ler atualizações do catálogo: " + String(e) }); }
+    const expected = new Map();
+    for (const item of effectiveItems.values()) {
+        if (!isReadableComicItem(item)) continue;
+        const id = item.mimeType === "application/vnd.google-apps.shortcut" ? item.shortcutDetails?.targetId : item.id;
+        if (id) expected.set(id, item.name || id);
+    }
+    const found = new Set();
+    let storedObjects = 0;
+    let storedBytes = 0;
+    let cursor;
+    try {
+        do {
+            const page = await env.COMIC_CACHE.list({ prefix: "drive/", limit: 1000, cursor });
+            for (const object of page.objects || []) {
+                storedObjects++;
+                storedBytes += Number(object.size) || 0;
+                const id = object.key.slice("drive/".length);
+                if (expected.has(id)) found.add(id);
+            }
+            cursor = page.truncated ? page.cursor : undefined;
+        } while (cursor);
+    } catch (e) { return json(500, { error: "Falha ao comparar objetos no R2: " + String(e) }); }
+    const missing = [];
+    for (const [id, name] of expected) if (!found.has(id)) missing.push({ id, name });
+    return json(200, {
+        r2OnlyReady: missing.length === 0,
+        expectedComicFiles: expected.size,
+        presentInR2: found.size,
+        missingCount: missing.length,
+        missingExamples: missing.slice(0, 100),
+        missingListTruncated: missing.length > 100,
+        r2DriveObjects: storedObjects,
+        r2DriveBytes: storedBytes
+    });
+}
+
 async function handleDriveList(url, env) {
+    const json = (status, data) => catalogJson(status, data);
+    const q = url.searchParams.get("q") || "";
+    const pageToken = url.searchParams.get("pageToken") || "";
+    if (q.length > 300 || !(PARENT_Q_RE.test(q) || NAME_Q_RE.test(q))) return json(400, { error: "Consulta não permitida." });
+    if (pageToken.length > 2000) return json(400, { error: "pageToken inválido." });
+    let catalog;
+    try { catalog = await getR2Catalog(env); }
+    catch (e) { return json(500, { error: String(e) }); }
+    if (!catalog) {
+        if (await isR2OnlyMode(env)) return json(503, { error: "O catálogo R2-only está ativo, mas catalog/index.json não foi encontrado." });
+        return handleDriveListFromDrive(url, env);
+    }
+    let items;
+    const parentMatch = /^'([A-Za-z0-9_-]{10,100})' in parents and trashed = false$/.exec(q);
+    try {
+        if (parentMatch) {
+            const merged = new Map((catalog.byParent.get(parentMatch[1]) || []).map(item => [item.id, item]));
+            for (const item of await loadCatalogMetadataUpdates(env, parentMatch[1])) merged.set(item.id, item);
+            items = [...merged.values()];
+        } else {
+            const nameMatch = /^name contains '((?:[^'\\]|\\.)*)' and trashed = false$/.exec(q);
+            if (!nameMatch) return json(400, { error: "Consulta não permitida." });
+            const needle = nameMatch[1].replace(/\\'/g, "'").replace(/\\\\/g, "\\").toLocaleLowerCase();
+            const merged = new Map(catalog.allItems.map(item => [item.id, item]));
+            for (const item of await loadCatalogMetadataUpdates(env)) merged.set(item.id, item);
+            items = [...merged.values()].filter(item => String(item.name || "").toLocaleLowerCase().includes(needle));
+        }
+    } catch (e) { return json(500, { error: "Falha ao mesclar atualizações incrementais do catálogo: " + String(e) }); }
+    let offset = 0;
+    if (pageToken) {
+        const match = /^r2:(\d+)$/.exec(pageToken);
+        if (!match) return json(400, { error: "pageToken R2 inválido; atualize a lista e tente novamente." });
+        offset = Number(match[1]);
+    }
+    const pageSize = 1000;
+    const files = items.slice(offset, offset + pageSize);
+    const nextPageToken = offset + files.length < items.length ? `r2:${offset + files.length}` : null;
+    return json(200, { files, nextPageToken });
+}
+
+async function handleDriveListFromDrive(url, env) {
     const json = (status, obj) => new Response(JSON.stringify(obj), {
         status: status,
         headers: {
