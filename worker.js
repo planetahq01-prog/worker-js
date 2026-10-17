@@ -417,7 +417,7 @@ export default {
         if (url.searchParams.get("drive_list") === "1") {
             const denied = await requireAccessCode(url, env);
             if (denied) return denied;
-            return handleDriveList(url, env);
+            return handleDriveList(url, env, ctx);
         }
         if (url.searchParams.get("grant") === "1") {
             const email = (url.searchParams.get("email") || "").trim().toLowerCase();
@@ -1492,7 +1492,7 @@ async function handleAdminCatalogCoverage(env) {
     });
 }
 
-async function handleDriveList(url, env) {
+async function handleDriveList(url, env, ctx) {
     const json = (status, data) => catalogJson(status, data);
     const q = url.searchParams.get("q") || "";
     const pageToken = url.searchParams.get("pageToken") || "";
@@ -1522,11 +1522,13 @@ async function handleDriveList(url, env) {
                 let drivePageToken = r2OffsetMatch ? "" : pageToken;
                 const liveItems = [];
                 let liveOk = true;
+                const liveStartedAt = Date.now();
                 for (let page = 0; page < 100; page++) {
+                    if (Date.now() - liveStartedAt > 6500) { liveOk = false; break; }
                     const liveUrl = new URL(url);
                     liveUrl.searchParams.delete("pageToken");
                     if (drivePageToken) liveUrl.searchParams.set("pageToken", drivePageToken);
-                    const response = await handleDriveListFromDrive(liveUrl, env);
+                    const response = await handleDriveListFromDrive(liveUrl, env, { attempts: 1, timeoutMs: 6000 });
                     if (!response.ok) { liveOk = false; break; }
                     let payload;
                     try { payload = await response.json(); } catch (_) { liveOk = false; break; }
@@ -1541,7 +1543,7 @@ async function handleDriveList(url, env) {
                         merged.set(item.id, { ...(merged.get(item.id) || {}), ...item });
                     }
                     items = [...merged.values()];
-                    try {
+                    const syncTask = (async () => { try {
                         const folderMime = "application/vnd.google-apps.folder";
                         const comicName = /\.(pdf|cbz|cbr)$/i;
                         const candidates = liveItems.filter(item => String(item.mimeType || "") === folderMime ||
@@ -1556,7 +1558,9 @@ async function handleDriveList(url, env) {
                         }
                     } catch (e) {
                         console.warn("[PlanetaHQ] R2-first folder metadata sync failed", String(e?.message || e));
-                    }
+                    } })();
+                    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(syncTask);
+                    else await syncTask;
                 }
                 // If Drive is unavailable, preserve the already-indexed R2 listing.
                 items = [...merged.values()];
@@ -1582,7 +1586,7 @@ async function handleDriveList(url, env) {
     return json(200, { files, nextPageToken });
 }
 
-async function handleDriveListFromDrive(url, env) {
+async function handleDriveListFromDrive(url, env, retryOptions = {}) {
     const json = (status, obj) => new Response(JSON.stringify(obj), {
         status: status,
         headers: {
@@ -1617,8 +1621,8 @@ async function handleDriveListFromDrive(url, env) {
     if (pageToken) params.set("pageToken", pageToken);
     try {
         const res = await fetchUpstreamWithRetry(`https://www.googleapis.com/drive/v3/files?${params.toString()}`, {}, {
-            attempts: 3,
-            timeoutMs: 12e3
+            attempts: retryOptions.attempts ?? 3,
+            timeoutMs: retryOptions.timeoutMs ?? 12e3
         });
         const responseBody = await res.text();
         if (res.status === 403) {
