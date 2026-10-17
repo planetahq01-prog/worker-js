@@ -1073,7 +1073,9 @@ async function handleAdminCatalogSearch(url, env) {
             const listUrl = new URL("https://admin.local/");
             listUrl.searchParams.set("q", `'${folderId}' in parents and trashed = false`);
             if (task.pageToken) listUrl.searchParams.set("pageToken", task.pageToken);
-            const response = await handleDriveList(listUrl, env);
+            // A busca do editor é administrativa e precisa descobrir itens novos
+            // no Drive mesmo quando o catálogo do app está em modo R2-only.
+            const response = await handleDriveListFromDrive(listUrl, env);
             let payload;
             try { payload = await response.json(); } catch (_) { payload = { error: "Resposta inválida do Google Drive." }; }
             return { folderId, response, payload };
@@ -1102,6 +1104,33 @@ async function handleAdminCatalogSearch(url, env) {
         }
     }
 
+    let indexedRecords = 0;
+    let catalogSyncError = "";
+    if (newFiles.length) {
+        try {
+            const catalogCandidates = [];
+            for (const item of newFiles) {
+                const mime = String(item.mimeType || "");
+                const name = String(item.name || "");
+                if (mime === folderMime) {
+                    catalogCandidates.push(item);
+                } else if (comicName.test(name) && ID_RE.test(String(item.id || "")) && await env.COMIC_CACHE.head(`drive/${item.id}`)) {
+                    // Only publish comic entries in the app catalog when their
+                    // media object is already in R2; the admin can still find
+                    // and edit uncached Drive items without making them appear
+                    // as broken entries in R2-only mode.
+                    catalogCandidates.push(item);
+                }
+            }
+            if (catalogCandidates.length) {
+                const metadataState = await collectCatalogMetadata(env, catalogCandidates);
+                indexedRecords = await persistCatalogMetadataUpdates(env, metadataState);
+            }
+        } catch (e) {
+            catalogSyncError = String(e?.message || e);
+            console.warn("[PlanetaHQ] admin search catalog sync failed", catalogSyncError);
+        }
+    }
     state.queue = queue;
     state.seenFolders = [...seenFolders];
     state.matchedIds = [...matchedIds];
@@ -1117,6 +1146,8 @@ async function handleAdminCatalogSearch(url, env) {
         partial: !!state.blockedFolders || !!state.truncated,
         blockedFolders: Number(state.blockedFolders) || 0,
         scannedFolders: Number(state.scannedRequests) || 0,
+        indexedRecords,
+        catalogSyncError: catalogSyncError || undefined,
         truncated: !!state.truncated,
         done: !hasMore
     });
@@ -1504,7 +1535,7 @@ async function handleDriveListFromDrive(url, env) {
     }
     const params = new URLSearchParams({
         q: q,
-        fields: "nextPageToken, files(id,name,mimeType,size,createdTime,modifiedTime,shortcutDetails,thumbnailLink)",
+        fields: "nextPageToken, files(id,name,mimeType,size,createdTime,modifiedTime,shortcutDetails,thumbnailLink,parents)",
         pageSize: "1000",
         supportsAllDrives: "true",
         includeItemsFromAllDrives: "true",
