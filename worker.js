@@ -702,7 +702,7 @@ export default {
                 });
             }
             const declared = Number(request.headers.get("Content-Length") || 0);
-            if (!declared || declared > MAX_COVER_BYTES) {
+            if (declared > MAX_COVER_BYTES) {
                 return new Response("Tamanho inválido.", {
                     status: 413,
                     headers: corsHeaders()
@@ -809,7 +809,8 @@ export default {
                 const already = await env.COMIC_CACHE.head(warmCacheKey);
                 if (already) {
                     const indexedRecords = await persistCatalogMetadataUpdates(env, metadataState);
-                    return new Response(JSON.stringify({ cached: true, alreadyCached: true, indexed: true, id: mediaId, indexedRecords }), {
+                    const coverResult = await cacheDriveThumbnail(env, mediaItem, mediaId);
+                    return new Response(JSON.stringify({ cached: true, alreadyCached: true, indexed: true, id: mediaId, indexedRecords, coverCached: !!coverResult.cached, coverError: coverResult.error || undefined }), {
                         headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" }
                     });
                 }
@@ -823,9 +824,11 @@ export default {
                     });
                 }
                 const contentType = driveRes.headers.get("Content-Type") || "application/octet-stream";
+                const coverPromise = cacheDriveThumbnail(env, mediaItem, mediaId);
                 await putStreamToR2(env.COMIC_CACHE, warmCacheKey, driveRes.body, contentType);
                 const indexedRecords = await persistCatalogMetadataUpdates(env, metadataState);
-                return new Response(JSON.stringify({ cached: true, indexed: true, id: mediaId, indexedRecords }), {
+                const coverResult = await coverPromise;
+                return new Response(JSON.stringify({ cached: true, indexed: true, id: mediaId, indexedRecords, coverCached: !!coverResult.cached, coverError: coverResult.error || undefined }), {
                     headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" }
                 });
             } catch (e) {
@@ -1246,6 +1249,27 @@ function driveMediaUrl(fileId, env) {
     return `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&key=${encodeURIComponent(env.DRIVE_API_KEY)}`;
 }
 
+async function cacheDriveThumbnail(env, item, fileId) {
+    const key = `cover/${fileId}`;
+    try {
+        if (await env.COMIC_CACHE.head(key)) return { cached: true, alreadyCached: true };
+        const thumbnailUrl = String(item?.thumbnailLink || "");
+        if (!thumbnailUrl || !/^https:\/\//i.test(thumbnailUrl)) return { cached: false, error: "O Drive não forneceu miniatura para este arquivo." };
+        const response = await fetchUpstreamWithRetry(thumbnailUrl, {}, { attempts: 2, timeoutMs: 10000 });
+        if (!response.ok) return { cached: false, error: `Miniatura indisponível (HTTP ${response.status}).` };
+        const type = String(response.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
+        if (!COVER_TYPES.includes(type)) return { cached: false, error: `Formato de miniatura não aceito (${type || "desconhecido"}).` };
+        const declared = Number(response.headers.get("Content-Length") || 0);
+        if (declared > MAX_COVER_BYTES) return { cached: false, error: "A miniatura excede 3 MB." };
+        const bytes = await response.arrayBuffer();
+        if (!bytes.byteLength || bytes.byteLength > MAX_COVER_BYTES) return { cached: false, error: "Tamanho de miniatura inválido." };
+        await env.COMIC_CACHE.put(key, bytes, { httpMetadata: { contentType: type } });
+        return { cached: true };
+    } catch (e) {
+        return { cached: false, error: String(e?.message || e).slice(0, 200) };
+    }
+}
+
 async function getR2Catalog(env) {
     const now = Date.now();
     if (r2CatalogMemo.loaded && now < r2CatalogMemo.expiresAt) return r2CatalogMemo.value;
@@ -1488,6 +1512,55 @@ async function handleDriveList(url, env) {
             const merged = new Map((catalog.byParent.get(parentMatch[1]) || []).map(item => [item.id, item]));
             for (const item of await loadCatalogMetadataUpdates(env, parentMatch[1])) merged.set(item.id, item);
             items = [...merged.values()];
+            // R2-first: combine the indexed catalogue with the live folder contents.
+            // This reveals items added since the last export/import; cached files are
+            // also persisted incrementally so a later R2-only switch keeps them visible.
+            if (!(await isR2OnlyMode(env)) && env.DRIVE_API_KEY) {
+                const pageToken = url.searchParams.get("pageToken") || "";
+                const r2OffsetMatch = /^r2:(\d+)$/.exec(pageToken);
+                const offset = r2OffsetMatch ? Number(r2OffsetMatch[1]) : 0;
+                let drivePageToken = r2OffsetMatch ? "" : pageToken;
+                const liveItems = [];
+                let liveOk = true;
+                for (let page = 0; page < 100; page++) {
+                    const liveUrl = new URL(url);
+                    liveUrl.searchParams.delete("pageToken");
+                    if (drivePageToken) liveUrl.searchParams.set("pageToken", drivePageToken);
+                    const response = await handleDriveListFromDrive(liveUrl, env);
+                    if (!response.ok) { liveOk = false; break; }
+                    let payload;
+                    try { payload = await response.json(); } catch (_) { liveOk = false; break; }
+                    liveItems.push(...(Array.isArray(payload.files) ? payload.files : []));
+                    drivePageToken = payload.nextPageToken || "";
+                    if (!drivePageToken) break;
+                    if (page === 99) liveOk = false;
+                }
+                if (liveOk) {
+                    for (const item of liveItems) {
+                        if (!item?.id) continue;
+                        merged.set(item.id, { ...(merged.get(item.id) || {}), ...item });
+                    }
+                    items = [...merged.values()];
+                    try {
+                        const folderMime = "application/vnd.google-apps.folder";
+                        const comicName = /\.(pdf|cbz|cbr)$/i;
+                        const candidates = liveItems.filter(item => String(item.mimeType || "") === folderMime ||
+                            (comicName.test(String(item.name || "")) && ID_RE.test(String(item.id || ""))));
+                        const cachedCandidates = (await Promise.all(candidates.map(async item => {
+                            if (String(item.mimeType || "") === folderMime) return item;
+                            return await env.COMIC_CACHE.head(`drive/${item.id}`) ? item : null;
+                        }))).filter(Boolean);
+                        if (cachedCandidates.length) {
+                            const metadataState = await collectCatalogMetadata(env, cachedCandidates);
+                            await persistCatalogMetadataUpdates(env, metadataState);
+                        }
+                    } catch (e) {
+                        console.warn("[PlanetaHQ] R2-first folder metadata sync failed", String(e?.message || e));
+                    }
+                }
+                // If Drive is unavailable, preserve the already-indexed R2 listing.
+                items = [...merged.values()];
+            }
         } else {
             const nameMatch = /^name contains '((?:[^'\\]|\\.)*)' and trashed = false$/.exec(q);
             if (!nameMatch) return json(400, { error: "Consulta não permitida." });
