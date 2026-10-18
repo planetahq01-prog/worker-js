@@ -1065,6 +1065,8 @@ async function handleAdminCatalogSearch(url, env) {
     const maxResults = 500;
     const folderMime = "application/vnd.google-apps.folder";
     const comicName = /\.(pdf|cbz|cbr)$/i;
+    const shortcutMime = "application/vnd.google-apps.shortcut";
+    const comicMimes = new Set(["application/pdf", "application/zip", "application/x-cbz", "application/vnd.comicbook+zip", "application/x-zip-compressed", "application/x-rar-compressed", "application/vnd.rar", "application/x-cbr", "application/vnd.comicbook-rar", "application/x-rar"]);
     let requestsThisCall = 0;
 
     while (queue.length && requestsThisCall < maxRequestsPerCall && matchedIds.size < maxResults) {
@@ -1091,10 +1093,21 @@ async function handleAdminCatalogSearch(url, env) {
                 continue;
             }
             if (result.payload.nextPageToken) queue.push({ folderId: result.folderId, pageToken: result.payload.nextPageToken });
-            for (const file of Array.isArray(result.payload.files) ? result.payload.files : []) {
+            for (const rawFile of Array.isArray(result.payload.files) ? result.payload.files : []) {
+                const shortcut = String(rawFile?.mimeType || "") === shortcutMime ? rawFile.shortcutDetails : null;
+                // The app resolves Drive shortcuts before displaying them. Mirror
+                // that behavior here, or a new shortcut to a collection/comic is
+                // invisible to the admin search and its target folder is never scanned.
+                const file = shortcut?.targetId && shortcut?.targetMimeType ? {
+                    ...rawFile,
+                    id: shortcut.targetId,
+                    mimeType: shortcut.targetMimeType,
+                    parents: [result.folderId]
+                } : rawFile;
+                const mime = String(file?.mimeType || "");
                 const name = String(file.name || "");
-                const mime = String(file.mimeType || "");
-                if ((mime === folderMime || comicName.test(name)) && norm(name).includes(needle) && file.id && !matchedIds.has(file.id)) {
+                const isComic = comicName.test(name) || comicMimes.has(mime);
+                if ((mime === folderMime || isComic) && norm(name).includes(needle) && file.id && !matchedIds.has(file.id)) {
                     matchedIds.add(file.id);
                     newFiles.push(file);
                     if (matchedIds.size >= maxResults) { state.truncated = true; queue.length = 0; break; }
@@ -1117,7 +1130,7 @@ async function handleAdminCatalogSearch(url, env) {
                 const name = String(item.name || "");
                 if (mime === folderMime) {
                     catalogCandidates.push(item);
-                } else if (comicName.test(name) && ID_RE.test(String(item.id || "")) && await env.COMIC_CACHE.head(`drive/${item.id}`)) {
+                } else if ((comicName.test(name) || comicMimes.has(mime)) && ID_RE.test(String(item.id || "")) && await env.COMIC_CACHE.head(`drive/${item.id}`)) {
                     // Only publish comic entries in the app catalog when their
                     // media object is already in R2; the admin can still find
                     // and edit uncached Drive items without making them appear
