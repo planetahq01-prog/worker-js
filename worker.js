@@ -19,6 +19,24 @@ const driveMetadataMemo = new Map();
 
 const COVER_TYPES = [ "image/jpeg", "image/png", "image/webp" ];
 
+const DRIVE_THUMBNAIL_HOSTS = [
+    "googleusercontent.com",
+    "google.com",
+    "googleapis.com",
+    "gstatic.com"
+];
+
+function isAllowedDriveThumbnailUrl(value) {
+    try {
+        const parsed = new URL(String(value || ""));
+        if (parsed.protocol !== "https:") return false;
+        const hostname = parsed.hostname.toLowerCase();
+        return DRIVE_THUMBNAIL_HOSTS.some(host => hostname === host || hostname.endsWith(`.${host}`));
+    } catch (_) {
+        return false;
+    }
+}
+
 const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
 const UPSTREAM_RETRY_STATUSES = new Set([ 408, 425, 429, 500, 502, 503, 504 ]);
@@ -794,6 +812,15 @@ export default {
                     if (!targetId) throw new Error("O atalho não informa targetId.");
                     mediaItem = await getDriveMetadataForCatalog(targetId, env);
                     metadataItems.push(mediaItem);
+                }
+                // A listagem do Drive frequentemente já traz uma thumbnailLink
+                // válida para o arquivo/atalho, mesmo quando files.get() não a
+                // devolve novamente. O aquecedor pode encaminhá-la, mas só
+                // aceitamos hosts oficiais do Google para evitar que a rota
+                // administrativa vire um proxy aberto.
+                const suppliedThumbnailLink = url.searchParams.get("thumbnailLink");
+                if (suppliedThumbnailLink && isAllowedDriveThumbnailUrl(suppliedThumbnailLink)) {
+                    mediaItem = { ...mediaItem, thumbnailLink: suppliedThumbnailLink };
                 }
                 const isFolder = requestedItem.mimeType === "application/vnd.google-apps.folder" || mediaItem.mimeType === "application/vnd.google-apps.folder";
                 const metadataState = await collectCatalogMetadata(env, metadataItems);
