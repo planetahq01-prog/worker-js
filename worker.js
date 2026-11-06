@@ -329,7 +329,7 @@ export default {
             return handleAdminCover(request, url, env);
         }
         if (url.searchParams.get("detail_metadata") === "1") {
-            return handlePublicDetailMetadata(env);
+            return handlePublicDetailMetadata(env, url);
         }
         if (url.searchParams.get("auth_check") === "1") {
             const code = normalizeCode(url.searchParams.get("code") || "");
@@ -1045,17 +1045,30 @@ function requireAdminToken(request, env) {
     if (!given || !safeEqual(given, env.ADMIN_TOKEN)) return json(401, "ADMIN_TOKEN incorreto ou ausente.");
     return null;
 }
-async function handlePublicDetailMetadata(env) {
+async function handlePublicDetailMetadata(env, url) {
     try {
+        const requestedIds = url ? [...new Set([
+            ...url.searchParams.getAll("id"),
+            ...(url.searchParams.get("ids") || "").split(",")
+        ].map(id => String(id || "").trim()).filter(Boolean))].slice(0, 50) : [];
         const items = {};
+        if (requestedIds.length) {
+            await Promise.all(requestedIds.filter(id => ID_RE.test(id)).map(async id => {
+                const value = await env.ACCESS_CODES.get(`detail-meta:${id}`);
+                if (value) { try { items[id] = JSON.parse(value); } catch (_) {} }
+            }));
+            return new Response(JSON.stringify({ items }), { headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
+        }
         let cursor;
         do {
             const listing = await env.ACCESS_CODES.list({ prefix: "detail-meta:", limit: 1000, cursor });
-            for (const key of listing.keys) {
+            const records = await Promise.all(listing.keys.map(async key => {
                 const id = key.name.slice("detail-meta:".length);
                 const value = await env.ACCESS_CODES.get(key.name);
-                if (value) { try { items[id] = JSON.parse(value); } catch (_) {} }
-            }
+                if (!value) return null;
+                try { return [id, JSON.parse(value)]; } catch (_) { return null; }
+            }));
+            for (const record of records) if (record) items[record[0]] = record[1];
             cursor = listing.list_complete ? undefined : listing.cursor;
         } while (cursor);
         return new Response(JSON.stringify({ items }), { headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
