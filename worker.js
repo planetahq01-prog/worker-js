@@ -1223,7 +1223,7 @@ async function handleAdminMetadata(request, url, env) {
     const id = String(body.id || "");
     if (!ID_RE.test(id) || !body.metadata || typeof body.metadata !== "object" || Array.isArray(body.metadata)) return json(400, { error: "Dados inválidos." });
     const m = body.metadata;
-    const clean = { displayTitle: String(m.displayTitle || m.title || "").slice(0, 240), author: String(m.author || "").slice(0, 500), publicationDate: String(m.publicationDate || "").slice(0, 100), genres: Array.isArray(m.genres) ? m.genres.slice(0, 20).map(x => String(x).slice(0, 60)) : [], synopsis: String(m.synopsis || "").slice(0, 5000) };
+    const clean = { displayTitle: String(m.displayTitle || m.title || "").slice(0, 240), author: String(m.author || "").slice(0, 500), publicationDate: String(m.publicationDate || "").slice(0, 1000), genres: Array.isArray(m.genres) ? m.genres.slice(0, 20).map(x => String(x).slice(0, 60)) : [], synopsis: String(m.synopsis || "").slice(0, 5000) };
     if (m.coverId && ID_RE.test(String(m.coverId))) clean.coverId = String(m.coverId);
     await env.ACCESS_CODES.put(`detail-meta:${id}`, JSON.stringify(clean));
     return json(200, { saved: true, id });
