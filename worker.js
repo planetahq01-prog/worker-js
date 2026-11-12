@@ -197,7 +197,7 @@ function createResilientFullMediaStream(firstBytes, firstRange, totalSize, drive
                 const result = await fetchUpstreamBufferedWithRetry(driveUrl, {
                     headers: { Range: `bytes=${start}-${end}` },
                     signal
-                }, { attempts: 4, timeoutMs: 25000, maxBufferBytes: MEDIA_MAX_BUFFER_BYTES });
+                }, { attempts: 5, timeoutMs: 90000, maxBufferBytes: MEDIA_MAX_BUFFER_BYTES });
                 if (!result.bytes || result.response.status !== 206) {
                     try { await result.response?.body?.cancel(); } catch (_) {}
                     throw new Error(`Google Drive não entregou o bloco ${start}-${end} como HTTP 206.`);
@@ -921,8 +921,9 @@ export default {
                 // before replying so an upstream body reset can be retried
                 // without exposing a truncated 206 response to the browser.
                 const result = await fetchUpstreamBufferedWithRetry(driveUrl, {
-                    headers: { ...driveFetchHeaders, signal: request.signal }
-                }, { attempts: 4, timeoutMs: 25000, maxBufferBytes: MEDIA_MAX_BUFFER_BYTES });
+                    headers: driveFetchHeaders,
+                    signal: request.signal
+                }, { attempts: 5, timeoutMs: 90000, maxBufferBytes: MEDIA_MAX_BUFFER_BYTES });
                 driveRes = result.response;
                 bodyBytes = result.bytes;
             } else {
@@ -932,8 +933,9 @@ export default {
                 // in Worker memory or downloading a PDF before first render.
                 const firstEnd = MEDIA_CHUNK_BYTES - 1;
                 const result = await fetchUpstreamBufferedWithRetry(driveUrl, {
-                    headers: { Range: `bytes=0-${firstEnd}`, signal: request.signal }
-                }, { attempts: 4, timeoutMs: 25000, maxBufferBytes: MEDIA_MAX_BUFFER_BYTES });
+                    headers: { Range: `bytes=0-${firstEnd}` },
+                    signal: request.signal
+                }, { attempts: 5, timeoutMs: 90000, maxBufferBytes: MEDIA_MAX_BUFFER_BYTES });
                 driveRes = result.response;
                 bodyBytes = result.bytes;
                 if (driveRes.status === 206 && bodyBytes) {
@@ -961,6 +963,13 @@ export default {
         } catch (e) {
             console.error("[PlanetaHQ Worker] Drive media failed after body retries:", String(e?.message || e));
             return new Response("Falha temporária ao acessar o Google Drive após repetir o bloco. Tente novamente.", {
+                status: 502,
+                headers: { ...corsHeaders(), "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" }
+            });
+        }
+        if (rangeHeader && driveRes && driveRes.status !== 206) {
+            try { await driveRes.body?.cancel(); } catch (_) {}
+            return new Response("O Google Drive não respeitou a faixa de bytes solicitada.", {
                 status: 502,
                 headers: { ...corsHeaders(), "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" }
             });
