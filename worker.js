@@ -13,8 +13,12 @@ const R2_CATALOG_MODE_KEY = "catalog/mode.json";
 const R2_CATALOG_UPDATE_PREFIX = "catalog/updates/";
 const R2_CATALOG_ROOT_ID = "11JGPcNE-t4R4G8NaefyATXW3cWeu2n8Y";
 const R2_CATALOG_CACHE_TTL_MS = 30000;
+const R2_CATALOG_UPDATE_MEMO_TTL_MS = 30000;
+const R2_CATALOG_UPDATE_MEMO_MAX_ENTRIES = 128;
 let r2CatalogMemo = { expiresAt: 0, value: null, loaded: false };
 let r2OnlyMemo = { expiresAt: 0, value: false, loaded: false };
+const r2CatalogUpdateListMemo = new Map();
+const r2CatalogUpdateFingerprintMemo = new Map();
 const driveMetadataMemo = new Map();
 
 const COVER_TYPES = [ "image/jpeg", "image/png", "image/webp" ];
@@ -1417,22 +1421,67 @@ async function collectCatalogMetadata(env, startingItems) {
     return { catalog, records: [...records.values()] };
 }
 
+function stableCatalogJson(value) {
+    if (Array.isArray(value)) return `[${value.map(stableCatalogJson).join(",")}]`;
+    if (value && typeof value === "object") {
+        const keys = Object.keys(value).filter(key => value[key] !== undefined).sort();
+        return `{${keys.map(key => `${JSON.stringify(key)}:${stableCatalogJson(value[key])}`).join(",")}}`;
+    }
+    return JSON.stringify(value);
+}
+
+function rememberCatalogUpdateFingerprint(key, item) {
+    const now = Date.now();
+    if (r2CatalogUpdateFingerprintMemo.size >= 10000) {
+        for (const [memoKey, entry] of r2CatalogUpdateFingerprintMemo) {
+            if (entry.expiresAt <= now) r2CatalogUpdateFingerprintMemo.delete(memoKey);
+        }
+        if (r2CatalogUpdateFingerprintMemo.size >= 10000) r2CatalogUpdateFingerprintMemo.clear();
+    }
+    r2CatalogUpdateFingerprintMemo.set(key, {
+        fingerprint: stableCatalogJson(item),
+        expiresAt: now + R2_CATALOG_UPDATE_MEMO_TTL_MS
+    });
+}
+
 async function persistCatalogMetadataUpdates(env, state) {
     let saved = 0;
     for (const item of state.records) {
         if (!item || !item.id || state.catalog?.byId.has(item.id)) continue;
         const parents = Array.isArray(item.parents) ? item.parents : [];
+        const fingerprint = stableCatalogJson(item);
+        const serialized = JSON.stringify(item);
         for (const parentId of parents) {
             if (!ID_RE.test(parentId)) continue;
             const key = `${R2_CATALOG_UPDATE_PREFIX}${parentId}/${item.id}.json`;
-            await env.COMIC_CACHE.put(key, JSON.stringify(item), { httpMetadata: { contentType: "application/json; charset=utf-8" } });
+            const memo = r2CatalogUpdateFingerprintMemo.get(key);
+            if (memo && memo.expiresAt > Date.now() && memo.fingerprint === fingerprint) continue;
+            if (!memo || memo.expiresAt <= Date.now()) {
+                let existing = null;
+                try { existing = await env.COMIC_CACHE.get(key); } catch (_) {}
+                if (existing) {
+                    try {
+                        const existingItem = JSON.parse(await existing.text());
+                        rememberCatalogUpdateFingerprint(key, existingItem);
+                        if (stableCatalogJson(existingItem) === fingerprint) continue;
+                    } catch (_) {}
+                }
+            }
+            await env.COMIC_CACHE.put(key, serialized, { httpMetadata: { contentType: "application/json; charset=utf-8" } });
+            rememberCatalogUpdateFingerprint(key, item);
             saved++;
         }
     }
+    if (saved) r2CatalogUpdateListMemo.clear();
     return saved;
 }
 
 async function loadCatalogMetadataUpdates(env, parentId = null) {
+    const memoKey = parentId || "__all__";
+    const now = Date.now();
+    const cached = r2CatalogUpdateListMemo.get(memoKey);
+    if (cached && cached.expiresAt > now) return cached.items;
+
     const prefix = parentId ? `${R2_CATALOG_UPDATE_PREFIX}${parentId}/` : R2_CATALOG_UPDATE_PREFIX;
     const byId = new Map();
     let cursor;
@@ -1445,15 +1494,34 @@ async function loadCatalogMetadataUpdates(env, parentId = null) {
                 const obj = await env.COMIC_CACHE.get(entry.key);
                 if (!obj) return null;
                 const item = JSON.parse(await obj.text());
-                return item && item.id && item.name ? item : null;
+                return item && item.id && item.name ? { key: entry.key, item } : null;
             }));
-            for (const item of rows) if (item) byId.set(item.id, item);
+            for (const row of rows) {
+                if (!row) continue;
+                byId.set(row.item.id, row.item);
+                rememberCatalogUpdateFingerprint(row.key, row.item);
+            }
         }
         cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
-    return [...byId.values()];
-}
 
+    const items = [...byId.values()];
+    if (items.length <= 5000) {
+        if (r2CatalogUpdateListMemo.size >= R2_CATALOG_UPDATE_MEMO_MAX_ENTRIES) {
+            for (const [key, entry] of r2CatalogUpdateListMemo) {
+                if (entry.expiresAt <= now) r2CatalogUpdateListMemo.delete(key);
+            }
+            while (r2CatalogUpdateListMemo.size >= R2_CATALOG_UPDATE_MEMO_MAX_ENTRIES) {
+                r2CatalogUpdateListMemo.delete(r2CatalogUpdateListMemo.keys().next().value);
+            }
+        }
+        r2CatalogUpdateListMemo.set(memoKey, {
+            items,
+            expiresAt: Date.now() + R2_CATALOG_UPDATE_MEMO_TTL_MS
+        });
+    }
+    return items;
+}
 function catalogJson(status, data) {
     return new Response(JSON.stringify(data), { status, headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
 }
@@ -1572,7 +1640,9 @@ async function handleDriveList(url, env, ctx) {
     try {
         if (parentMatch) {
             const merged = new Map((catalog.byParent.get(parentMatch[1]) || []).map(item => [item.id, item]));
-            for (const item of await loadCatalogMetadataUpdates(env, parentMatch[1])) merged.set(item.id, item);
+            const parentUpdates = await loadCatalogMetadataUpdates(env, parentMatch[1]);
+            const parentUpdateIds = new Set(parentUpdates.map(item => String(item.id)));
+            for (const item of parentUpdates) merged.set(item.id, item);
             items = [...merged.values()];
             // R2-first: combine the indexed catalogue with the live folder contents.
             // This reveals items added since the last export/import; cached files are
@@ -1612,6 +1682,9 @@ async function handleDriveList(url, env, ctx) {
                             (comicName.test(String(item.name || "")) && ID_RE.test(String(item.id || ""))));
                         const cachedCandidates = (await Promise.all(candidates.map(async item => {
                             if (String(item.mimeType || "") === folderMime) return item;
+                            // O item já está no catálogo-base ou nas atualizações persistidas;
+                            // nesses casos, um HEAD não muda a decisão de persistência.
+                            if (catalog.byId.has(item.id) || parentUpdateIds.has(String(item.id))) return item;
                             return await env.COMIC_CACHE.head(`drive/${item.id}`) ? item : null;
                         }))).filter(Boolean);
                         if (cachedCandidates.length) {
