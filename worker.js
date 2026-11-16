@@ -1640,14 +1640,18 @@ async function handleDriveList(url, env, ctx) {
     try {
         if (parentMatch) {
             const merged = new Map((catalog.byParent.get(parentMatch[1]) || []).map(item => [item.id, item]));
-            const parentUpdates = await loadCatalogMetadataUpdates(env, parentMatch[1]);
-            const parentUpdateIds = new Set(parentUpdates.map(item => String(item.id)));
-            for (const item of parentUpdates) merged.set(item.id, item);
             items = [...merged.values()];
             // R2-first: combine the indexed catalogue with the live folder contents.
-            // This reveals items added since the last export/import; cached files are
-            // also persisted incrementally so a later R2-only switch keeps them visible.
-            if (!(await isR2OnlyMode(env)) && env.DRIVE_API_KEY) {
+            // In this mode the live Drive response is authoritative for the folder.
+            // Do not list catalog/updates/<folder>/ and GET every update on every
+            // folder request: that turns a library crawl into R2 Class A + B fan-out.
+            // R2-only still merges persisted updates below because Drive is disabled.
+            const r2Only = await isR2OnlyMode(env);
+            if (r2Only) {
+                const parentUpdates = await loadCatalogMetadataUpdates(env, parentMatch[1]);
+                for (const item of parentUpdates) merged.set(item.id, item);
+                items = [...merged.values()];
+            } else if (env.DRIVE_API_KEY) {
                 const pageToken = url.searchParams.get("pageToken") || "";
                 const r2OffsetMatch = /^r2:(\d+)$/.exec(pageToken);
                 const offset = r2OffsetMatch ? Number(r2OffsetMatch[1]) : 0;
@@ -1675,29 +1679,20 @@ async function handleDriveList(url, env, ctx) {
                         merged.set(item.id, { ...(merged.get(item.id) || {}), ...item });
                     }
                     items = [...merged.values()];
-                    const syncTask = (async () => { try {
-                        const folderMime = "application/vnd.google-apps.folder";
-                        const comicName = /\.(pdf|cbz|cbr)$/i;
-                        const candidates = liveItems.filter(item => String(item.mimeType || "") === folderMime ||
-                            (comicName.test(String(item.name || "")) && ID_RE.test(String(item.id || ""))));
-                        const cachedCandidates = (await Promise.all(candidates.map(async item => {
-                            if (String(item.mimeType || "") === folderMime) return item;
-                            // O item já está no catálogo-base ou nas atualizações persistidas;
-                            // nesses casos, um HEAD não muda a decisão de persistência.
-                            if (catalog.byId.has(item.id) || parentUpdateIds.has(String(item.id))) return item;
-                            return await env.COMIC_CACHE.head(`drive/${item.id}`) ? item : null;
-                        }))).filter(Boolean);
-                        if (cachedCandidates.length) {
-                            const metadataState = await collectCatalogMetadata(env, cachedCandidates);
-                            await persistCatalogMetadataUpdates(env, metadataState);
-                        }
-                    } catch (e) {
-                        console.warn("[PlanetaHQ] R2-first folder metadata sync failed", String(e?.message || e));
-                    } })();
-                    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(syncTask);
-                    else await syncTask;
+                    // New/changed files remain visible from the live Drive listing.
+                    // Catalog metadata is published by the explicit admin warm/index
+                    // flows, not by HEAD-checking every comic during normal app reads.
+                } else {
+                    // Drive temporarily unavailable: preserve the previous fallback
+                    // behavior and read persisted incremental metadata from R2.
+                    const parentUpdates = await loadCatalogMetadataUpdates(env, parentMatch[1]);
+                    for (const item of parentUpdates) merged.set(item.id, item);
+                    items = [...merged.values()];
                 }
-                // If Drive is unavailable, preserve the already-indexed R2 listing.
+            } else {
+                // Without a live Drive key, use the stored snapshot and updates.
+                const parentUpdates = await loadCatalogMetadataUpdates(env, parentMatch[1]);
+                for (const item of parentUpdates) merged.set(item.id, item);
                 items = [...merged.values()];
             }
         } else {
