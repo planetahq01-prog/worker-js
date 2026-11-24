@@ -418,12 +418,26 @@ export default {
             }
         }
         if (url.searchParams.get("revoke_access") === "1") {
-            const result = await revokeAccessByEmail(url.searchParams.get("email") || "", env);
+            if (request.method !== "GET" && request.method !== "POST") {
+                return new Response(JSON.stringify({ error: "Use GET ou POST para revogar acesso." }), {
+                    status: 405,
+                    headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" }
+                });
+            }
+            let email = url.searchParams.get("email") || "";
+            if (request.method === "POST") {
+                try {
+                    const body = await request.json();
+                    email = typeof body?.email === "string" ? body.email : email;
+                } catch (_) {}
+            }
+            const result = await revokeAccessByEmail(email, env);
             return new Response(JSON.stringify(result), {
                 status: result.ok ? 200 : 400,
                 headers: {
                     ...corsHeaders(),
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json",
+                    "Cache-Control": "no-store"
                 }
             });
         }
@@ -2108,38 +2122,68 @@ async function revokeAccessByEmail(rawEmail, env) {
     if (!EMAIL_RE.test(email)) {
         return { ok: false, error: "E-mail inválido." };
     }
-
-    let deletedCodes = 0;
-    let emailMappingFound = false;
-    let cursor;
-
-    // Remove o vínculo direto e também varre os registros access:* para
-    // eliminar códigos órfãos que ainda tenham este e-mail associado.
     const emailKey = `email:${email}`;
-    if (await env.ACCESS_CODES.get(emailKey)) emailMappingFound = true;
-    await env.ACCESS_CODES.delete(emailKey);
+    const rawMappedCode = await env.ACCESS_CODES.get(emailKey);
+    const mappedCode = normalizeCode(rawMappedCode || "");
+    const emailMappingFound = !!rawMappedCode;
+    let deletedCodes = 0;
+    let directDeletionCompleted = false;
 
-    do {
-        const options = { prefix: "access:" };
-        if (cursor) options.cursor = cursor;
-        const page = await env.ACCESS_CODES.list(options);
-        for (const key of page.keys || []) {
-            const raw = await env.ACCESS_CODES.get(key.name);
-            if (!raw) continue;
+    // O fluxo normal mantém um vínculo direto email:<endereço> -> código.
+    // Remova esse código sem percorrer a base inteira de usuários.
+    if (/^[A-Z0-9]{8}$/.test(mappedCode)) {
+        const accessKey = `access:${mappedCode}`;
+        const raw = await env.ACCESS_CODES.get(accessKey);
+        if (raw) {
             try {
                 const data = JSON.parse(raw);
                 const storedEmail = String(data?.email || "").trim().toLowerCase();
+                // Não revogue um registro que, por inconsistência, pertença a
+                // outro e-mail. Nesse caso, o fallback procura a associação real.
                 if (storedEmail === email) {
-                    await env.ACCESS_CODES.delete(key.name);
+                    await env.ACCESS_CODES.delete(accessKey);
                     deletedCodes++;
+                    directDeletionCompleted = true;
                 }
-            } catch (_) {
-                // Ignora registros inválidos e não relacionados; a rota não
-                // deve falhar por causa de um registro corrompido diferente.
-            }
+            } catch (_) {}
         }
-        cursor = page.list_complete ? null : page.cursor;
-    } while (cursor);
+    }
+
+    // Se o vínculo estiver ausente/órfão, procure registros antigos em lotes
+    // paralelos. A versão anterior fazia um KV.get sequencial para cada usuário,
+    // o que podia deixar a solicitação carregando por muito tempo.
+    if (!directDeletionCompleted) {
+        let cursor;
+        do {
+            const options = { prefix: "access:" };
+            if (cursor) options.cursor = cursor;
+            const page = await env.ACCESS_CODES.list(options);
+            const keys = page.keys || [];
+            const batchSize = 50;
+            for (let i = 0; i < keys.length; i += batchSize) {
+                const batch = keys.slice(i, i + batchSize);
+                const removed = await Promise.all(batch.map(async key => {
+                    try {
+                        const raw = await env.ACCESS_CODES.get(key.name);
+                        if (!raw) return false;
+                        const data = JSON.parse(raw);
+                        const storedEmail = String(data?.email || "").trim().toLowerCase();
+                        if (storedEmail !== email) return false;
+                        await env.ACCESS_CODES.delete(key.name);
+                        return true;
+                    } catch (_) {
+                        return false;
+                    }
+                }));
+                deletedCodes += removed.filter(Boolean).length;
+            }
+            cursor = page.list_complete ? null : page.cursor;
+        } while (cursor);
+    }
+
+    // Apague o índice só depois da tentativa de revogação para que, em caso de
+    // erro na varredura alternativa, a operação possa ser repetida com segurança.
+    await env.ACCESS_CODES.delete(emailKey);
 
     return {
         ok: true,
