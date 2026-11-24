@@ -305,6 +305,11 @@ export default {
             if (denied) return denied;
             return handleAdminCatalogCoverage(env);
         }
+        if (url.pathname === "/admin/catalog-reindex") {
+            const denied = requireAdminToken(request, env);
+            if (denied) return denied;
+            return handleAdminCatalogReindex(request, env);
+        }
         if (url.pathname === "/admin/search") {
             const denied = requireAdminToken(request, env);
             if (denied) return denied;
@@ -1259,7 +1264,7 @@ async function handleAdminCover(request, url, env) {
 function corsHeaders() {
     return {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, HEAD, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Methods": "GET, HEAD, PUT, POST, DELETE, OPTIONS",
         "Access-Control-Allow-Headers": "Range, Content-Type, X-Admin-Token",
         "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges"
     };
@@ -1526,6 +1531,22 @@ function catalogJson(status, data) {
     return new Response(JSON.stringify(data), { status, headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
 }
 
+function mergeCatalogUpdateIfNewer(merged, item) {
+    if (!item?.id) return;
+    const current = merged.get(item.id);
+    if (!current) { merged.set(item.id, item); return; }
+    const currentTime = Date.parse(current.modifiedTime || "");
+    const updateTime = Date.parse(item.modifiedTime || "");
+    // O catálogo-base pode ter acabado de ser reconstituído. Não deixe uma
+    // cópia incremental antiga esconder nomes/pais mais novos; registros sem
+    // datas válidas mantêm a precedência histórica dos incrementos.
+    if (Number.isFinite(currentTime) && currentTime > 0 && Number.isFinite(updateTime) && updateTime > 0) {
+        if (updateTime > currentTime) merged.set(item.id, { ...current, ...item });
+        return;
+    }
+    merged.set(item.id, { ...current, ...item });
+}
+
 async function handleAdminCatalogUpload(request, env) {
     if (request.method !== "PUT") return catalogJson(405, { error: "Use PUT para enviar o índice." });
     const declared = Number(request.headers.get("Content-Length") || 0);
@@ -1545,6 +1566,148 @@ async function handleAdminCatalogUpload(request, env) {
         r2CatalogMemo = { expiresAt: 0, value: null, loaded: false };
         return catalogJson(200, { saved: true, key: R2_CATALOG_KEY, bytes: bytes.byteLength, items: data.items.length, generatedAt: data.generatedAt || null });
     } catch (e) { return catalogJson(500, { error: "Falha ao salvar o índice no R2: " + String(e) }); }
+}
+
+// Reindexação administrativa pontual: recebe uma fotografia dos metadados do
+// Drive, enumera drive/ uma única vez (1 operação Classe A por página), e grava
+// um único catálogo. Não faz HEAD/GET/PUT por HQ, nem é executada nas leituras
+// normais do app.
+async function handleAdminCatalogReindex(request, env) {
+    const json = (status, data) => catalogJson(status, data);
+    if (request.method !== "POST") return json(405, { error: "Use POST para enviar a fotografia de metadados." });
+    const declared = Number(request.headers.get("Content-Length") || 0);
+    if (declared > MAX_CATALOG_BYTES) return json(413, { error: "Fotografia muito grande (limite 25 MB)." });
+    let payload;
+    try {
+        const bytes = await request.arrayBuffer();
+        if (!bytes.byteLength || bytes.byteLength > MAX_CATALOG_BYTES) return json(413, { error: "Fotografia vazia ou acima do limite de 25 MB." });
+        payload = JSON.parse(new TextDecoder().decode(bytes));
+    } catch (_) { return json(400, { error: "Envie JSON válido com rootId e items[]." }); }
+    if (!payload || payload.rootId !== R2_CATALOG_ROOT_ID || !Array.isArray(payload.items) || payload.items.length > 250000) {
+        return json(400, { error: "Formato inválido; esperado rootId da biblioteca e items[] (máximo 250 mil)." });
+    }
+
+    let catalog;
+    try { catalog = await getR2Catalog(env); }
+    catch (e) { return json(500, { error: String(e?.message || e) }); }
+    if (!catalog || catalog.manifest.rootId !== R2_CATALOG_ROOT_ID) {
+        return json(409, { error: "O catálogo-base da biblioteca não foi encontrado no R2." });
+    }
+
+    const folderMime = "application/vnd.google-apps.folder";
+    const shortcutMime = "application/vnd.google-apps.shortcut";
+    const incoming = new Map();
+    const shortcutIds = new Set();
+    for (const raw of payload.items) {
+        if (!raw || typeof raw.name !== "string" || !raw.name || typeof raw.mimeType !== "string") continue;
+        const isShortcut = raw.mimeType === shortcutMime;
+        const targetId = isShortcut ? raw.shortcutDetails?.targetId : raw.id;
+        const targetMimeType = isShortcut ? raw.shortcutDetails?.targetMimeType : raw.mimeType;
+        if (!ID_RE.test(String(targetId || "")) || !targetMimeType) continue;
+        // Se o mesmo destino também aparece diretamente no Drive, prefira sua
+        // localização/nome real em vez de um atalho; caso contrário, preserve
+        // a localização do atalho como faz o cliente do aplicativo.
+        if (incoming.has(targetId) && !shortcutIds.has(targetId) && isShortcut) continue;
+        const item = {
+            id: targetId,
+            name: raw.name,
+            mimeType: targetMimeType,
+            parents: Array.isArray(raw.parents) ? [...new Set(raw.parents.filter(id => ID_RE.test(String(id))))] : []
+        };
+        for (const key of ["size", "createdTime", "modifiedTime", "thumbnailLink", "shortcutDetails"]) {
+            if (!isShortcut && raw[key] !== undefined) item[key] = raw[key];
+        }
+        incoming.set(item.id, item);
+        if (isShortcut) shortcutIds.add(item.id);
+        else shortcutIds.delete(item.id);
+    }
+
+    // Somente itens cuja cadeia de pais chega à raiz são aceitos. Assim, uma
+    // fotografia de outra pasta/conta não é injetada no catálogo da biblioteca.
+    const reachesRootMemo = new Map([[R2_CATALOG_ROOT_ID, true]]);
+    function reachesRoot(id, visiting = new Set()) {
+        if (reachesRootMemo.has(id)) return reachesRootMemo.get(id);
+        if (visiting.has(id)) return false;
+        const item = incoming.get(id);
+        if (!item) return false;
+        visiting.add(id);
+        const ok = item.parents.some(parent => reachesRoot(parent, visiting));
+        visiting.delete(id);
+        reachesRootMemo.set(id, ok);
+        return ok;
+    }
+
+    const cachedIds = new Set();
+    let cursor;
+    let r2ListPages = 0;
+    try {
+        do {
+            const page = await env.COMIC_CACHE.list({ prefix: "drive/", limit: 1000, cursor });
+            r2ListPages++;
+            for (const object of page.objects || []) cachedIds.add(object.key.slice("drive/".length));
+            cursor = page.truncated ? page.cursor : undefined;
+            if (cursor && r2ListPages >= 250) return json(413, { error: "O prefixo drive/ excedeu 250 mil objetos; nenhuma alteração foi feita." });
+        } while (cursor);
+    } catch (e) { return json(500, { error: "Falha ao listar objetos do R2; nenhuma alteração foi feita: " + String(e?.message || e) }); }
+
+    const selected = new Map();
+    for (const item of incoming.values()) {
+        if (isReadableComicItem(item) && cachedIds.has(item.id) && reachesRoot(item.id)) selected.set(item.id, item);
+    }
+    // Acrescenta apenas pastas ancestrais dos arquivos confirmados no R2; não
+    // expõe arquivos não armazenados, mesmo que apareçam na fotografia do Drive.
+    for (const comic of [...selected.values()]) {
+        let parentIds = [...comic.parents];
+        let depth = 0;
+        const visited = new Set([comic.id]);
+        while (parentIds.length && depth++ < 20) {
+            const next = [];
+            for (const parentId of parentIds) {
+                if (parentId === R2_CATALOG_ROOT_ID || visited.has(parentId)) continue;
+                visited.add(parentId);
+                const folder = incoming.get(parentId);
+                if (!folder || folder.mimeType !== folderMime || !reachesRoot(parentId)) continue;
+                selected.set(folder.id, folder);
+                next.push(...folder.parents);
+            }
+            parentIds = next;
+        }
+    }
+
+    const merged = new Map(catalog.manifest.items.filter(item => item && typeof item.id === "string").map(item => [item.id, item]));
+    let addedRecords = 0;
+    let refreshedRecords = 0;
+    for (const [id, item] of selected) {
+        const previous = merged.get(id);
+        if (!previous) addedRecords++;
+        else refreshedRecords++;
+        merged.set(id, item);
+    }
+    const manifest = {
+        ...catalog.manifest,
+        schemaVersion: 1,
+        rootId: R2_CATALOG_ROOT_ID,
+        generatedAt: new Date().toISOString(),
+        items: [...merged.values()]
+    };
+    const bytes = new TextEncoder().encode(JSON.stringify(manifest));
+    if (bytes.byteLength > MAX_CATALOG_BYTES) return json(413, { error: "O catálogo atualizado excederia o limite de 25 MB; nenhuma alteração foi feita." });
+    try {
+        await env.COMIC_CACHE.put(R2_CATALOG_KEY, bytes, { httpMetadata: { contentType: "application/json; charset=utf-8" } });
+        r2CatalogMemo = { expiresAt: 0, value: null, loaded: false };
+        r2CatalogUpdateListMemo.clear();
+        return json(200, {
+            saved: true,
+            cachedComicsIndexed: [...selected.values()].filter(isReadableComicItem).length,
+            addedRecords,
+            refreshedRecords,
+            driveItemsReceived: incoming.size,
+            r2ObjectsScanned: cachedIds.size,
+            r2ListPages,
+            r2Operations: { listPages: r2ListPages, catalogWrites: 1, perComicHeadGetOrPut: 0 },
+            catalogBytes: bytes.byteLength
+        });
+    } catch (e) { return json(500, { error: "Falha ao salvar o catálogo atualizado no R2: " + String(e?.message || e) }); }
 }
 
 async function handleAdminCatalogMode(request, env) {
@@ -1649,7 +1812,7 @@ async function handleDriveList(url, env, ctx) {
             const r2Only = await isR2OnlyMode(env);
             if (r2Only) {
                 const parentUpdates = await loadCatalogMetadataUpdates(env, parentMatch[1]);
-                for (const item of parentUpdates) merged.set(item.id, item);
+                for (const item of parentUpdates) mergeCatalogUpdateIfNewer(merged, item);
                 items = [...merged.values()];
             } else if (env.DRIVE_API_KEY) {
                 const pageToken = url.searchParams.get("pageToken") || "";
@@ -1686,13 +1849,13 @@ async function handleDriveList(url, env, ctx) {
                     // Drive temporarily unavailable: preserve the previous fallback
                     // behavior and read persisted incremental metadata from R2.
                     const parentUpdates = await loadCatalogMetadataUpdates(env, parentMatch[1]);
-                    for (const item of parentUpdates) merged.set(item.id, item);
+                    for (const item of parentUpdates) mergeCatalogUpdateIfNewer(merged, item);
                     items = [...merged.values()];
                 }
             } else {
                 // Without a live Drive key, use the stored snapshot and updates.
                 const parentUpdates = await loadCatalogMetadataUpdates(env, parentMatch[1]);
-                for (const item of parentUpdates) merged.set(item.id, item);
+                for (const item of parentUpdates) mergeCatalogUpdateIfNewer(merged, item);
                 items = [...merged.values()];
             }
         } else {
@@ -1700,7 +1863,7 @@ async function handleDriveList(url, env, ctx) {
             if (!nameMatch) return json(400, { error: "Consulta não permitida." });
             const needle = nameMatch[1].replace(/\\'/g, "'").replace(/\\\\/g, "\\").toLocaleLowerCase();
             const merged = new Map(catalog.allItems.map(item => [item.id, item]));
-            for (const item of await loadCatalogMetadataUpdates(env)) merged.set(item.id, item);
+            for (const item of await loadCatalogMetadataUpdates(env)) mergeCatalogUpdateIfNewer(merged, item);
             items = [...merged.values()].filter(item => String(item.name || "").toLocaleLowerCase().includes(needle));
         }
     } catch (e) { return json(500, { error: "Falha ao mesclar atualizações incrementais do catálogo: " + String(e) }); }
