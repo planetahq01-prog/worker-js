@@ -1531,7 +1531,19 @@ function catalogJson(status, data) {
     return new Response(JSON.stringify(data), { status, headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
 }
 
+function normalizeCatalogListingItem(item) {
+    if (!item || item.mimeType !== "application/vnd.google-apps.shortcut") return item;
+    const details = item.shortcutDetails || {};
+    const targetId = String(details.targetId || "");
+    const targetMimeType = String(details.targetMimeType || "");
+    if (!ID_RE.test(targetId) || !targetMimeType) return item;
+    const normalized = { ...item, id: targetId, mimeType: targetMimeType };
+    delete normalized.shortcutDetails;
+    return normalized;
+}
+
 function mergeCatalogUpdateIfNewer(merged, item) {
+    item = normalizeCatalogListingItem(item);
     if (!item?.id) return;
     const current = merged.get(item.id);
     if (!current) { merged.set(item.id, item); return; }
@@ -1799,11 +1811,12 @@ async function handleDriveList(url, env, ctx) {
         return handleDriveListFromDrive(url, env);
     }
     let items;
-    const parentMatch = /^'([A-Za-z0-9_-]{10,100})' in parents and trashed = false$/.exec(q);
-    try {
-        if (parentMatch) {
-            const merged = new Map((catalog.byParent.get(parentMatch[1]) || []).map(item => [item.id, item]));
-            items = [...merged.values()];
+        const parentMatch = /^'([A-Za-z0-9_-]{10,100})' in parents and trashed = false$/.exec(q);
+        try {
+            if (parentMatch) {
+                const merged = new Map();
+                for (const item of catalog.byParent.get(parentMatch[1]) || []) mergeCatalogUpdateIfNewer(merged, item);
+                items = [...merged.values()];
             // R2-first: combine the indexed catalogue with the live folder contents.
             // In this mode the live Drive response is authoritative for the folder.
             // Do not list catalog/updates/<folder>/ and GET every update on every
@@ -1836,8 +1849,9 @@ async function handleDriveList(url, env, ctx) {
                     if (!drivePageToken) break;
                     if (page === 99) liveOk = false;
                 }
-                if (liveOk) {
-                    for (const item of liveItems) {
+                    if (liveOk) {
+                    for (const rawItem of liveItems) {
+                        const item = normalizeCatalogListingItem(rawItem);
                         if (!item?.id) continue;
                         merged.set(item.id, { ...(merged.get(item.id) || {}), ...item });
                     }
@@ -1862,7 +1876,8 @@ async function handleDriveList(url, env, ctx) {
             const nameMatch = /^name contains '((?:[^'\\]|\\.)*)' and trashed = false$/.exec(q);
             if (!nameMatch) return json(400, { error: "Consulta não permitida." });
             const needle = nameMatch[1].replace(/\\'/g, "'").replace(/\\\\/g, "\\").toLocaleLowerCase();
-            const merged = new Map(catalog.allItems.map(item => [item.id, item]));
+            const merged = new Map();
+            for (const item of catalog.allItems) mergeCatalogUpdateIfNewer(merged, item);
             for (const item of await loadCatalogMetadataUpdates(env)) mergeCatalogUpdateIfNewer(merged, item);
             items = [...merged.values()].filter(item => String(item.name || "").toLocaleLowerCase().includes(needle));
         }
