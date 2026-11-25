@@ -20,12 +20,6 @@ let r2OnlyMemo = { expiresAt: 0, value: false, loaded: false };
 const r2CatalogUpdateListMemo = new Map();
 const r2CatalogUpdateFingerprintMemo = new Map();
 const driveMetadataMemo = new Map();
-const SHARED_RECENT_ADDED_PREFIX = "shared:recent-added:comic:";
-const SHARED_RECENT_ADDED_MAX_IDS = 50000;
-const SHARED_RECENT_ADDED_MAX_BODY_BYTES = 5 * 1024 * 1024;
-const SHARED_RECENT_ADDED_MEMO_TTL_MS = 15000;
-let sharedRecentAddedMemo = { expiresAt: 0, ids: null };
-let sharedRecentAddedMutationQueue = Promise.resolve();
 
 const COVER_TYPES = [ "image/jpeg", "image/png", "image/webp" ];
 
@@ -316,6 +310,11 @@ export default {
             if (denied) return denied;
             return handleAdminCatalogReindex(request, env);
         }
+        if (url.pathname === "/admin/catalog-repair-r2") {
+            const denied = requireAdminToken(request, env);
+            if (denied) return denied;
+            return handleAdminCatalogRepairR2(request, env);
+        }
         if (url.pathname === "/admin/search") {
             const denied = requireAdminToken(request, env);
             if (denied) return denied;
@@ -345,17 +344,6 @@ export default {
         }
         if (url.searchParams.get("detail_metadata") === "1") {
             return handlePublicDetailMetadata(env, url);
-        }
-        if (url.searchParams.get("recent_added") === "1") {
-            if (request.method !== "GET" && request.method !== "POST") {
-                return new Response(JSON.stringify({ error: "Use GET ou POST para acessar Adicionados Recentemente." }), {
-                    status: 405,
-                    headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" }
-                });
-            }
-            const denied = await requireAccessCode(url, env);
-            if (denied) return denied;
-            return handleSharedRecentAdded(request, env);
         }
         if (url.searchParams.get("auth_check") === "1") {
             const code = normalizeCode(url.searchParams.get("code") || "");
@@ -435,26 +423,12 @@ export default {
             }
         }
         if (url.searchParams.get("revoke_access") === "1") {
-            if (request.method !== "GET" && request.method !== "POST") {
-                return new Response(JSON.stringify({ error: "Use GET ou POST para revogar acesso." }), {
-                    status: 405,
-                    headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" }
-                });
-            }
-            let email = url.searchParams.get("email") || "";
-            if (request.method === "POST") {
-                try {
-                    const body = await request.json();
-                    email = typeof body?.email === "string" ? body.email : email;
-                } catch (_) {}
-            }
-            const result = await revokeAccessByEmail(email, env);
+            const result = await revokeAccessByEmail(url.searchParams.get("email") || "", env);
             return new Response(JSON.stringify(result), {
                 status: result.ok ? 200 : 400,
                 headers: {
                     ...corsHeaders(),
-                    "Content-Type": "application/json",
-                    "Cache-Control": "no-store"
+                    "Content-Type": "application/json"
                 }
             });
         }
@@ -1562,19 +1536,7 @@ function catalogJson(status, data) {
     return new Response(JSON.stringify(data), { status, headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
 }
 
-function normalizeCatalogListingItem(item) {
-    if (!item || item.mimeType !== "application/vnd.google-apps.shortcut") return item;
-    const details = item.shortcutDetails || {};
-    const targetId = String(details.targetId || "");
-    const targetMimeType = String(details.targetMimeType || "");
-    if (!ID_RE.test(targetId) || !targetMimeType) return item;
-    const normalized = { ...item, id: targetId, mimeType: targetMimeType };
-    delete normalized.shortcutDetails;
-    return normalized;
-}
-
 function mergeCatalogUpdateIfNewer(merged, item) {
-    item = normalizeCatalogListingItem(item);
     if (!item?.id) return;
     const current = merged.get(item.id);
     if (!current) { merged.set(item.id, item); return; }
@@ -1753,6 +1715,165 @@ async function handleAdminCatalogReindex(request, env) {
     } catch (e) { return json(500, { error: "Falha ao salvar o catálogo atualizado no R2: " + String(e?.message || e) }); }
 }
 
+async function handleAdminCatalogRepairR2(request, env) {
+    const json = (status, data) => catalogJson(status, data);
+    if (request.method !== "POST") return json(405, { error: "Use POST para reparar os registros do catálogo." });
+    let body;
+    try { body = await request.json(); }
+    catch (_) { return json(400, { error: "Envie JSON válido com demolidorFolderId e sagaFolderId." }); }
+    const demolidorFolderId = String(body?.demolidorFolderId || "").trim();
+    const sagaFolderId = String(body?.sagaFolderId || "").trim();
+    if (!ID_RE.test(demolidorFolderId) || !ID_RE.test(sagaFolderId)) return json(400, { error: "Um dos IDs de pasta é inválido." });
+
+    let catalog;
+    try { catalog = await getR2Catalog(env); }
+    catch (e) { return json(500, { error: "Não foi possível ler o catálogo do R2: " + String(e?.message || e) }); }
+    if (!catalog || catalog.manifest.rootId !== R2_CATALOG_ROOT_ID) {
+        return json(409, { error: "O catálogo-base não foi encontrado ou a raiz não corresponde à biblioteca." });
+    }
+
+    try {
+        const merged = new Map(catalog.manifest.items.map(item => [item.id, item]));
+        const originalById = new Map(merged);
+        const existingDemolidor = merged.get(demolidorFolderId);
+        merged.set(demolidorFolderId, {
+            ...(existingDemolidor || {}),
+            id: demolidorFolderId,
+            name: "Coleção: Demolidor",
+            mimeType: "application/vnd.google-apps.folder",
+            parents: Array.isArray(existingDemolidor?.parents) && existingDemolidor.parents.length ? existingDemolidor.parents : [R2_CATALOG_ROOT_ID],
+            ...(existingDemolidor?.size !== undefined ? { size: existingDemolidor.size } : {})
+        });
+
+        const demolidorRows = [
+            { id: "1VKe7uB6BjaK6Vy3ANJ5JzH7FcjKuynSE", name: "Demolidor - Terra das Sombras.cbr" },
+            { id: "1kb3cCEFTrdjBO7YLjlfEWWu6BGGy6yRd", name: "Marvel Essenciais - Demolidor - Pai.cbr" },
+            { id: "18R5QPi3jIgbeo77Gq0HlWrSRPaLiDD_t", name: "Marvel Vintage - Demolidor - Fim dos Dias.cbr" }
+        ];
+        const demolidorPresent = [];
+        for (const row of demolidorRows) {
+            const head = await env.COMIC_CACHE.head(`drive/${row.id}`);
+            if (!head) continue;
+            const previous = merged.get(row.id) || {};
+            merged.set(row.id, {
+                ...previous,
+                id: row.id,
+                name: row.name,
+                mimeType: previous.mimeType || "application/x-rar-compressed",
+                parents: [demolidorFolderId],
+                ...(head.size ? { size: head.size } : {})
+            });
+            demolidorPresent.push(row.id);
+        }
+
+        const normalizeName = value => String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLocaleLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+        const targetSagaName = normalizeName("A Saga dos X-Men");
+        const sagaCandidates = [...originalById.values()].filter(item =>
+            item.id !== sagaFolderId &&
+            item.mimeType === "application/vnd.google-apps.folder" &&
+            normalizeName(item.name) === targetSagaName
+        );
+        let sagaResult = { repaired: false, reason: "Não encontrei a ficha antiga da pasta no catálogo; não inventei os IDs ou nomes dos volumes." };
+        let sagaHeadCount = 0;
+        if (sagaCandidates.length === 1) {
+            const oldFolder = sagaCandidates[0];
+            const childrenByParent = new Map();
+            for (const item of originalById.values()) {
+                for (const parentId of Array.isArray(item.parents) ? item.parents : []) {
+                    if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+                    childrenByParent.get(parentId).push(item);
+                }
+            }
+            const subtree = new Map();
+            const queue = [oldFolder.id];
+            while (queue.length) {
+                const parentId = queue.shift();
+                for (const child of childrenByParent.get(parentId) || []) {
+                    if (subtree.has(child.id)) continue;
+                    subtree.set(child.id, child);
+                    if (child.mimeType === "application/vnd.google-apps.folder") queue.push(child.id);
+                }
+            }
+            const comicCandidates = [...subtree.values()].filter(isReadableComicItem);
+            if (comicCandidates.length > 500) {
+                sagaResult = { repaired: false, reason: "A ficha antiga tem mais de 500 HQs; parei sem alterar essa coleção." };
+            } else {
+                const cachedComics = [];
+                for (let i = 0; i < comicCandidates.length; i += 10) {
+                    const batch = comicCandidates.slice(i, i + 10);
+                    const found = await Promise.all(batch.map(async item => ({ item, head: await env.COMIC_CACHE.head(`drive/${item.id}`) })));
+                    for (const row of found) if (row.head) cachedComics.push(row.item);
+                }
+                sagaHeadCount = comicCandidates.length;
+                if (cachedComics.length) {
+                    const usedFolderIds = new Set([oldFolder.id]);
+                    for (const comic of cachedComics) {
+                        for (const parentId of comic.parents || []) {
+                            let current = parentId;
+                            let depth = 0;
+                            while (current && depth++ < 20 && current !== oldFolder.id) {
+                                const ancestor = subtree.get(current);
+                                if (!ancestor || ancestor.mimeType !== "application/vnd.google-apps.folder") break;
+                                usedFolderIds.add(current);
+                                current = (ancestor.parents || []).find(id => subtree.has(id)) || "";
+                            }
+                        }
+                    }
+                    const newSagaFolder = {
+                        ...oldFolder,
+                        id: sagaFolderId,
+                        name: "A Saga dos X-Men",
+                        parents: Array.isArray(oldFolder.parents) && oldFolder.parents.length ? oldFolder.parents : [R2_CATALOG_ROOT_ID]
+                    };
+                    merged.delete(oldFolder.id);
+                    merged.set(sagaFolderId, newSagaFolder);
+                    for (const item of subtree.values()) {
+                        if (item.mimeType === "application/vnd.google-apps.folder") {
+                            if (!usedFolderIds.has(item.id)) continue;
+                            const updated = { ...item, parents: (item.parents || []).map(id => id === oldFolder.id ? sagaFolderId : id) };
+                            merged.set(updated.id, updated);
+                        } else if (isReadableComicItem(item)) {
+                            if (!cachedComics.some(cached => cached.id === item.id)) continue;
+                            const updated = { ...item, parents: (item.parents || []).map(id => id === oldFolder.id ? sagaFolderId : id) };
+                            merged.set(updated.id, updated);
+                        }
+                    }
+                    sagaResult = { repaired: true, oldFolderId: oldFolder.id, newFolderId: sagaFolderId, cachedComics: cachedComics.length };
+                } else {
+                    sagaResult = { repaired: false, reason: "Encontrei a ficha antiga, mas nenhum dos seus itens de HQ tem chave drive/<ID> no R2; essa parte ficou intacta." };
+                }
+            }
+        } else if (sagaCandidates.length > 1) {
+            sagaResult = { repaired: false, reason: "Há mais de uma pasta antiga com esse nome no catálogo; não escolhi uma arbitrariamente." };
+        }
+
+        const changed = demolidorPresent.length > 0 || sagaResult.repaired;
+        if (!changed) return json(200, {
+            saved: false,
+            demolidorPresentInR2: demolidorPresent.length,
+            saga: sagaResult,
+            operations: { exactR2Heads: demolidorRows.length + sagaHeadCount, catalogWrites: 0, mediaDownloads: 0, bucketListings: 0 }
+        });
+        const manifest = { ...catalog.manifest, schemaVersion: 1, rootId: R2_CATALOG_ROOT_ID, generatedAt: new Date().toISOString(), items: [...merged.values()] };
+        const bytes = new TextEncoder().encode(JSON.stringify(manifest));
+        if (bytes.byteLength > MAX_CATALOG_BYTES) return json(413, { error: "O catálogo excederia 25 MB; nenhuma alteração foi feita." });
+        await env.COMIC_CACHE.put(R2_CATALOG_KEY, bytes, { httpMetadata: { contentType: "application/json; charset=utf-8" } });
+        r2CatalogMemo = { expiresAt: 0, value: null, loaded: false };
+        r2CatalogUpdateListMemo.clear();
+        return json(200, {
+            saved: true,
+            demolidorPresentInR2: demolidorPresent.length,
+            demolidorIndexed: demolidorPresent,
+            saga: sagaResult,
+            catalogRecords: manifest.items.length,
+            catalogBytes: bytes.byteLength,
+            operations: { exactR2Heads: demolidorRows.length + sagaHeadCount, catalogWrites: 1, mediaDownloads: 0, bucketListings: 0 }
+        });
+    } catch (e) {
+        return json(500, { error: "Não consegui atualizar o catálogo; a gravação só ocorre depois das verificações. " + String(e?.message || e).slice(0, 240) });
+    }
+}
+
 async function handleAdminCatalogMode(request, env) {
     if (request.method !== "PUT") return catalogJson(405, { error: "Use PUT para alterar o modo." });
     let data;
@@ -1828,87 +1949,6 @@ async function handleAdminCatalogCoverage(env) {
     });
 }
 
-async function listSharedRecentAddedIds(env, force = false) {
-    const now = Date.now();
-    if (!force && Array.isArray(sharedRecentAddedMemo.ids) && now < sharedRecentAddedMemo.expiresAt) {
-        return sharedRecentAddedMemo.ids.slice();
-    }
-    const ids = new Set();
-    let cursor;
-    let pages = 0;
-    do {
-        const listing = await env.ACCESS_CODES.list({ prefix: SHARED_RECENT_ADDED_PREFIX, limit: 1000, cursor });
-        for (const key of listing.keys || []) {
-            const id = String(key.name || "").slice(SHARED_RECENT_ADDED_PREFIX.length);
-            if (ID_RE.test(id)) ids.add(id);
-        }
-        if (ids.size > SHARED_RECENT_ADDED_MAX_IDS) throw new Error("O histórico compartilhado ultrapassou o limite seguro de IDs.");
-        cursor = listing.list_complete ? undefined : listing.cursor;
-        pages++;
-        if (pages > Math.ceil(SHARED_RECENT_ADDED_MAX_IDS / 1000) + 1) throw new Error("A paginação do histórico compartilhado excedeu o limite seguro.");
-    } while (cursor);
-    const result = [...ids].sort();
-    sharedRecentAddedMemo = { expiresAt: now + SHARED_RECENT_ADDED_MEMO_TTL_MS, ids: result };
-    return result.slice();
-}
-
-function cleanSharedRecentIdArray(value, field) {
-    if (!Array.isArray(value) || value.length > SHARED_RECENT_ADDED_MAX_IDS) throw new Error(`Campo ${field} inválido ou grande demais.`);
-    const ids = new Set();
-    for (const item of value) {
-        const id = String(item || "");
-        if (!ID_RE.test(id)) throw new Error(`ID inválido no campo ${field}.`);
-        ids.add(id);
-    }
-    return ids;
-}
-
-async function handleSharedRecentAdded(request, env) {
-    const json = (status, data) => new Response(JSON.stringify(data), {
-        status,
-        headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" }
-    });
-    try {
-        if (request.method === "GET") {
-            return json(200, { ids: await listSharedRecentAddedIds(env) });
-        }
-        const declaredLength = Number(request.headers.get("Content-Length") || 0);
-        if (declaredLength > SHARED_RECENT_ADDED_MAX_BODY_BYTES) return json(413, { error: "Sincronização de recentes grande demais." });
-        const rawBody = await request.text();
-        if (new TextEncoder().encode(rawBody).byteLength > SHARED_RECENT_ADDED_MAX_BODY_BYTES) return json(413, { error: "Sincronização de recentes grande demais." });
-        const body = JSON.parse(rawBody || "{}");
-        const rootIds = cleanSharedRecentIdArray(body.rootIds, "rootIds");
-        const libraryIds = cleanSharedRecentIdArray(body.libraryIds, "libraryIds");
-        const knownIds = cleanSharedRecentIdArray(body.knownIds || [], "knownIds");
-        for (const id of rootIds) if (!libraryIds.has(id)) return json(400, { error: "Uma HQ da raiz não consta na lista completa da biblioteca." });
-
-        const mutate = async () => {
-            const existingIds = await listSharedRecentAddedIds(env);
-            const existing = new Set(existingIds);
-            const additions = new Set([...rootIds, ...knownIds]);
-            for (const id of additions) if (!libraryIds.has(id)) additions.delete(id);
-            const removals = existingIds.filter(id => !libraryIds.has(id));
-            const writes = [...additions].filter(id => !existing.has(id));
-            try {
-                await Promise.all(writes.map(id => env.ACCESS_CODES.put(`${SHARED_RECENT_ADDED_PREFIX}${id}`, "1")));
-                await Promise.all(removals.map(id => env.ACCESS_CODES.delete(`${SHARED_RECENT_ADDED_PREFIX}${id}`)));
-            } catch (error) {
-                sharedRecentAddedMemo = { expiresAt: 0, ids: null };
-                throw error;
-            }
-            const next = [...new Set([...existingIds.filter(id => libraryIds.has(id)), ...additions])].sort();
-            sharedRecentAddedMemo = { expiresAt: Date.now() + SHARED_RECENT_ADDED_MEMO_TTL_MS, ids: next };
-            return json(200, { ids: next, added: writes.length, removed: removals.length });
-        };
-        const operation = sharedRecentAddedMutationQueue.then(mutate, mutate);
-        sharedRecentAddedMutationQueue = operation.catch(() => {});
-        return await operation;
-    } catch (error) {
-        console.error("[PlanetaHQ Worker] shared recent-added sync failed", String(error?.message || error).slice(0, 240));
-        return json(400, { error: String(error?.message || "Falha no histórico compartilhado.").slice(0, 240) });
-    }
-}
-
 async function handleDriveList(url, env, ctx) {
     const json = (status, data) => catalogJson(status, data);
     const q = url.searchParams.get("q") || "";
@@ -1923,12 +1963,11 @@ async function handleDriveList(url, env, ctx) {
         return handleDriveListFromDrive(url, env);
     }
     let items;
-        const parentMatch = /^'([A-Za-z0-9_-]{10,100})' in parents and trashed = false$/.exec(q);
-        try {
-            if (parentMatch) {
-                const merged = new Map();
-                for (const item of catalog.byParent.get(parentMatch[1]) || []) mergeCatalogUpdateIfNewer(merged, item);
-                items = [...merged.values()];
+    const parentMatch = /^'([A-Za-z0-9_-]{10,100})' in parents and trashed = false$/.exec(q);
+    try {
+        if (parentMatch) {
+            const merged = new Map((catalog.byParent.get(parentMatch[1]) || []).map(item => [item.id, item]));
+            items = [...merged.values()];
             // R2-first: combine the indexed catalogue with the live folder contents.
             // In this mode the live Drive response is authoritative for the folder.
             // Do not list catalog/updates/<folder>/ and GET every update on every
@@ -1961,9 +2000,8 @@ async function handleDriveList(url, env, ctx) {
                     if (!drivePageToken) break;
                     if (page === 99) liveOk = false;
                 }
-                    if (liveOk) {
-                    for (const rawItem of liveItems) {
-                        const item = normalizeCatalogListingItem(rawItem);
+                if (liveOk) {
+                    for (const item of liveItems) {
                         if (!item?.id) continue;
                         merged.set(item.id, { ...(merged.get(item.id) || {}), ...item });
                     }
@@ -1988,8 +2026,7 @@ async function handleDriveList(url, env, ctx) {
             const nameMatch = /^name contains '((?:[^'\\]|\\.)*)' and trashed = false$/.exec(q);
             if (!nameMatch) return json(400, { error: "Consulta não permitida." });
             const needle = nameMatch[1].replace(/\\'/g, "'").replace(/\\\\/g, "\\").toLocaleLowerCase();
-            const merged = new Map();
-            for (const item of catalog.allItems) mergeCatalogUpdateIfNewer(merged, item);
+            const merged = new Map(catalog.allItems.map(item => [item.id, item]));
             for (const item of await loadCatalogMetadataUpdates(env)) mergeCatalogUpdateIfNewer(merged, item);
             items = [...merged.values()].filter(item => String(item.name || "").toLocaleLowerCase().includes(needle));
         }
@@ -2220,68 +2257,38 @@ async function revokeAccessByEmail(rawEmail, env) {
     if (!EMAIL_RE.test(email)) {
         return { ok: false, error: "E-mail inválido." };
     }
-    const emailKey = `email:${email}`;
-    const rawMappedCode = await env.ACCESS_CODES.get(emailKey);
-    const mappedCode = normalizeCode(rawMappedCode || "");
-    const emailMappingFound = !!rawMappedCode;
-    let deletedCodes = 0;
-    let directDeletionCompleted = false;
 
-    // O fluxo normal mantém um vínculo direto email:<endereço> -> código.
-    // Remova esse código sem percorrer a base inteira de usuários.
-    if (/^[A-Z0-9]{8}$/.test(mappedCode)) {
-        const accessKey = `access:${mappedCode}`;
-        const raw = await env.ACCESS_CODES.get(accessKey);
-        if (raw) {
+    let deletedCodes = 0;
+    let emailMappingFound = false;
+    let cursor;
+
+    // Remove o vínculo direto e também varre os registros access:* para
+    // eliminar códigos órfãos que ainda tenham este e-mail associado.
+    const emailKey = `email:${email}`;
+    if (await env.ACCESS_CODES.get(emailKey)) emailMappingFound = true;
+    await env.ACCESS_CODES.delete(emailKey);
+
+    do {
+        const options = { prefix: "access:" };
+        if (cursor) options.cursor = cursor;
+        const page = await env.ACCESS_CODES.list(options);
+        for (const key of page.keys || []) {
+            const raw = await env.ACCESS_CODES.get(key.name);
+            if (!raw) continue;
             try {
                 const data = JSON.parse(raw);
                 const storedEmail = String(data?.email || "").trim().toLowerCase();
-                // Não revogue um registro que, por inconsistência, pertença a
-                // outro e-mail. Nesse caso, o fallback procura a associação real.
                 if (storedEmail === email) {
-                    await env.ACCESS_CODES.delete(accessKey);
+                    await env.ACCESS_CODES.delete(key.name);
                     deletedCodes++;
-                    directDeletionCompleted = true;
                 }
-            } catch (_) {}
-        }
-    }
-
-    // Se o vínculo estiver ausente/órfão, procure registros antigos em lotes
-    // paralelos. A versão anterior fazia um KV.get sequencial para cada usuário,
-    // o que podia deixar a solicitação carregando por muito tempo.
-    if (!directDeletionCompleted) {
-        let cursor;
-        do {
-            const options = { prefix: "access:" };
-            if (cursor) options.cursor = cursor;
-            const page = await env.ACCESS_CODES.list(options);
-            const keys = page.keys || [];
-            const batchSize = 50;
-            for (let i = 0; i < keys.length; i += batchSize) {
-                const batch = keys.slice(i, i + batchSize);
-                const removed = await Promise.all(batch.map(async key => {
-                    try {
-                        const raw = await env.ACCESS_CODES.get(key.name);
-                        if (!raw) return false;
-                        const data = JSON.parse(raw);
-                        const storedEmail = String(data?.email || "").trim().toLowerCase();
-                        if (storedEmail !== email) return false;
-                        await env.ACCESS_CODES.delete(key.name);
-                        return true;
-                    } catch (_) {
-                        return false;
-                    }
-                }));
-                deletedCodes += removed.filter(Boolean).length;
+            } catch (_) {
+                // Ignora registros inválidos e não relacionados; a rota não
+                // deve falhar por causa de um registro corrompido diferente.
             }
-            cursor = page.list_complete ? null : page.cursor;
-        } while (cursor);
-    }
-
-    // Apague o índice só depois da tentativa de revogação para que, em caso de
-    // erro na varredura alternativa, a operação possa ser repetida com segurança.
-    await env.ACCESS_CODES.delete(emailKey);
+        }
+        cursor = page.list_complete ? null : page.cursor;
+    } while (cursor);
 
     return {
         ok: true,
