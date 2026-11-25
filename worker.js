@@ -20,6 +20,12 @@ let r2OnlyMemo = { expiresAt: 0, value: false, loaded: false };
 const r2CatalogUpdateListMemo = new Map();
 const r2CatalogUpdateFingerprintMemo = new Map();
 const driveMetadataMemo = new Map();
+const SHARED_RECENT_ADDED_PREFIX = "shared:recent-added:comic:";
+const SHARED_RECENT_ADDED_MAX_IDS = 50000;
+const SHARED_RECENT_ADDED_MAX_BODY_BYTES = 5 * 1024 * 1024;
+const SHARED_RECENT_ADDED_MEMO_TTL_MS = 15000;
+let sharedRecentAddedMemo = { expiresAt: 0, ids: null };
+let sharedRecentAddedMutationQueue = Promise.resolve();
 
 const COVER_TYPES = [ "image/jpeg", "image/png", "image/webp" ];
 
@@ -339,6 +345,17 @@ export default {
         }
         if (url.searchParams.get("detail_metadata") === "1") {
             return handlePublicDetailMetadata(env, url);
+        }
+        if (url.searchParams.get("recent_added") === "1") {
+            if (request.method !== "GET" && request.method !== "POST") {
+                return new Response(JSON.stringify({ error: "Use GET ou POST para acessar Adicionados Recentemente." }), {
+                    status: 405,
+                    headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" }
+                });
+            }
+            const denied = await requireAccessCode(url, env);
+            if (denied) return denied;
+            return handleSharedRecentAdded(request, env);
         }
         if (url.searchParams.get("auth_check") === "1") {
             const code = normalizeCode(url.searchParams.get("code") || "");
@@ -1809,6 +1826,87 @@ async function handleAdminCatalogCoverage(env) {
         r2DriveObjects: storedObjects,
         r2DriveBytes: storedBytes
     });
+}
+
+async function listSharedRecentAddedIds(env, force = false) {
+    const now = Date.now();
+    if (!force && Array.isArray(sharedRecentAddedMemo.ids) && now < sharedRecentAddedMemo.expiresAt) {
+        return sharedRecentAddedMemo.ids.slice();
+    }
+    const ids = new Set();
+    let cursor;
+    let pages = 0;
+    do {
+        const listing = await env.ACCESS_CODES.list({ prefix: SHARED_RECENT_ADDED_PREFIX, limit: 1000, cursor });
+        for (const key of listing.keys || []) {
+            const id = String(key.name || "").slice(SHARED_RECENT_ADDED_PREFIX.length);
+            if (ID_RE.test(id)) ids.add(id);
+        }
+        if (ids.size > SHARED_RECENT_ADDED_MAX_IDS) throw new Error("O histórico compartilhado ultrapassou o limite seguro de IDs.");
+        cursor = listing.list_complete ? undefined : listing.cursor;
+        pages++;
+        if (pages > Math.ceil(SHARED_RECENT_ADDED_MAX_IDS / 1000) + 1) throw new Error("A paginação do histórico compartilhado excedeu o limite seguro.");
+    } while (cursor);
+    const result = [...ids].sort();
+    sharedRecentAddedMemo = { expiresAt: now + SHARED_RECENT_ADDED_MEMO_TTL_MS, ids: result };
+    return result.slice();
+}
+
+function cleanSharedRecentIdArray(value, field) {
+    if (!Array.isArray(value) || value.length > SHARED_RECENT_ADDED_MAX_IDS) throw new Error(`Campo ${field} inválido ou grande demais.`);
+    const ids = new Set();
+    for (const item of value) {
+        const id = String(item || "");
+        if (!ID_RE.test(id)) throw new Error(`ID inválido no campo ${field}.`);
+        ids.add(id);
+    }
+    return ids;
+}
+
+async function handleSharedRecentAdded(request, env) {
+    const json = (status, data) => new Response(JSON.stringify(data), {
+        status,
+        headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" }
+    });
+    try {
+        if (request.method === "GET") {
+            return json(200, { ids: await listSharedRecentAddedIds(env) });
+        }
+        const declaredLength = Number(request.headers.get("Content-Length") || 0);
+        if (declaredLength > SHARED_RECENT_ADDED_MAX_BODY_BYTES) return json(413, { error: "Sincronização de recentes grande demais." });
+        const rawBody = await request.text();
+        if (new TextEncoder().encode(rawBody).byteLength > SHARED_RECENT_ADDED_MAX_BODY_BYTES) return json(413, { error: "Sincronização de recentes grande demais." });
+        const body = JSON.parse(rawBody || "{}");
+        const rootIds = cleanSharedRecentIdArray(body.rootIds, "rootIds");
+        const libraryIds = cleanSharedRecentIdArray(body.libraryIds, "libraryIds");
+        const knownIds = cleanSharedRecentIdArray(body.knownIds || [], "knownIds");
+        for (const id of rootIds) if (!libraryIds.has(id)) return json(400, { error: "Uma HQ da raiz não consta na lista completa da biblioteca." });
+
+        const mutate = async () => {
+            const existingIds = await listSharedRecentAddedIds(env);
+            const existing = new Set(existingIds);
+            const additions = new Set([...rootIds, ...knownIds]);
+            for (const id of additions) if (!libraryIds.has(id)) additions.delete(id);
+            const removals = existingIds.filter(id => !libraryIds.has(id));
+            const writes = [...additions].filter(id => !existing.has(id));
+            try {
+                await Promise.all(writes.map(id => env.ACCESS_CODES.put(`${SHARED_RECENT_ADDED_PREFIX}${id}`, "1")));
+                await Promise.all(removals.map(id => env.ACCESS_CODES.delete(`${SHARED_RECENT_ADDED_PREFIX}${id}`)));
+            } catch (error) {
+                sharedRecentAddedMemo = { expiresAt: 0, ids: null };
+                throw error;
+            }
+            const next = [...new Set([...existingIds.filter(id => libraryIds.has(id)), ...additions])].sort();
+            sharedRecentAddedMemo = { expiresAt: Date.now() + SHARED_RECENT_ADDED_MEMO_TTL_MS, ids: next };
+            return json(200, { ids: next, added: writes.length, removed: removals.length });
+        };
+        const operation = sharedRecentAddedMutationQueue.then(mutate, mutate);
+        sharedRecentAddedMutationQueue = operation.catch(() => {});
+        return await operation;
+    } catch (error) {
+        console.error("[PlanetaHQ Worker] shared recent-added sync failed", String(error?.message || error).slice(0, 240));
+        return json(400, { error: String(error?.message || "Falha no histórico compartilhado.").slice(0, 240) });
+    }
 }
 
 async function handleDriveList(url, env, ctx) {
