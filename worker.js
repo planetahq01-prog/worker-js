@@ -15,42 +15,47 @@ const R2_CATALOG_ROOT_ID = "11JGPcNE-t4R4G8NaefyATXW3cWeu2n8Y";
 const R2_DEMOLIDOR_FOLDER_ID = "18tH5RkW0MWvtqiCaJSQcIG9sb7gfq736";
 const R2_SAGA_XMEN_FOLDER_ID = "1jiBlGGjBlejTOeNjZ8CvMGrDnsqS1Myx";
 const R2_SAGA_XMEN_ITEMS = [
-    { id: "10ey57BLxTm84LB-uoS3T0xQb8ZEW_NAf", name: "A Saga dos X-Men - Volume 01.cbr" },
-    { id: "1a_bFx3S-8EQppRtkBs1kXvmkYdmHbwZJ", name: "A Saga dos X-Men - Volume 02.cbr" },
-    { id: "1onWLbKEL80zDKMZTLQbfKC13lysDNQfL", name: "A Saga dos X-Men - Volume 03.cbr" },
-    { id: "1DitL6mpLRvYV1eSQJMAM5uSq8VfJ4kib", name: "A Saga dos X-Men - Volume 04.cbr" },
-    { id: "1stBpGLBCTbwfvhOmR2DV3NWgblPnkfLh", name: "A Saga dos X-Men - Volume 05.cbr" },
-    { id: "179X5fzCsbZG33HuMfU8ocoUoWnghV6dy", name: "A Saga dos X-Men - Volume 06.cbr" },
-    { id: "1SsMTBXcRMsmrRa7Ozw1spWmHQiiZNxYy", name: "A Saga dos X-Men - Volume 07.cbr" },
-    { id: "1RIAT5cNpRgwCrLafpk39Oo25hcHeIDv4", name: "A Saga dos X-Men - Volume 08.cbr" },
-    { id: "1yZaXtDpAZorKhx4ywOt7PkBoXtX5kOTu", name: "A Saga dos X-Men - Volume 09.cbr" },
-    { id: "1eor0kLLnEOhElfnkP-RLHmaY-bGGsTU6", name: "A Saga dos X-Men - Volume 10.cbr" },
-    { id: "1y3vJCqAnav4DmFQoZiKjN0tlxUWgSOgx", name: "A Saga dos X-Men - Volume 11.cbr" },
-    { id: "1OR_ZKDc1fsXe2kXv_L2FiZHScN5AC_JE", name: "A Saga dos X-Men - Volume 12.cbr" },
-    { id: "1KmMd2EcYuUy0_77b0jo0KOWr9NTCnUWa", name: "A Saga dos X-Men - Volume 13.cbr" },
-    { id: "1K7oJRAV49n_I1nwtD9YRVkuKAdtwlF3w", name: "A Saga dos X-Men - Volume 14.cbr" },
-    { id: "1yS8j64OGdB7IAWHt5v41OF3yGB9_kztZ", name: "A Saga dos X-Men - Volume 15.cbr" },
-    { id: "1smSbhPNGA9VrYyImrqQHhzbyEzlxT0-9", name: "A Saga dos X-Men - Volume 16.cbr" },
-    { id: "1Xi7YGZ9xD8SGqJ-gBqdBZrTJJgvrGK_x", name: "A Saga dos X-Men - Volume 17.cbr" },
-    { id: "1vb8gXQZVME2FSYqTdQl0WiHNR8G5zKXe", name: "A Saga dos X-Men - Volume 18.cbr" },
-    { id: "1I8Jc368vkyAq9X_ytx8yGjwWxA7R1w0L", name: "A Saga dos X-Men - Volume 19.cbr" },
-    { id: "1PlJBbANrjhw6-5kIbgtzSO3BQVxVQzdr", name: "A Saga dos X-Men - Volume 20.cbr" },
-    { id: "11lTKW5pPyRdV5xUxXoVZElVpDo1fSwAK", name: "A Saga dos X-Men - Volume 21.cbr" },
-    { id: "1abKCrgsnthKZA0DffWGme22Upmwxkyy3", name: "A Saga dos X-Men - Volume 22.cbr" },
-    { id: "1F7AiZ3ZQl0dQnqD-bMdr-Y0kw0ih1P1o", name: "A Saga dos X-Men - Volume 23.cbr" },
-    { id: "1sUL7qINSUHp4RGnS6v8WO_5RFZOf-AeP", name: "A Saga dos X-Men - Volume 24.cbr" },
-    { id: "1TEXaGs1bgSqZZr8yrraugnuq2ShVsiCH", name: "A Saga dos X-Men - Volume 25.cbr" },
-    { id: "1RubE6btbLa5H9GMKtzHVUCOQ_V7403BV", name: "A Saga dos X-Men - Volume 26.cbr" },
-    { id: "1NG54k58l1yQ6Xq8fYGVuzZxGntfIXZ1g", name: "A Saga dos X-Men - Volume 27.cbr" },
-    { id: "1CK48vIV7jraqa6E2KbXe9G7CXblnPeuW", name: "A Saga dos X-Men - Volume 28.cbr" },
-    { id: "1m8f2cFW3nAa73ixjLasev_IGrr80wSSn", name: "A Saga dos X-Men - Volume 29.cbr" },
-    { id: "1XMaLLiUixgxsOWhlBqP7Jz0Js1OsK2sp", name: "A Saga dos X-Men - Volume 30.cbr" },
-    { id: "14wc9oi-vU2Q6w-jcN4M_x0PoGIxmtXYS", name: "A Saga dos X-Men - Volume 31.cbr" },
-    { id: "1dJZyzrdM_W_PLrqZDVy_NmqOKuqtCvys", name: "A Saga dos X-Men - Volume 32.cbr" },
-    { id: "1vh_U86hDHOl3dVRkdIkTGqEb8dvSjl_h", name: "A Saga dos X-Men - Volume 33.cbr" },
-    { id: "1hawLaVt2wqUEaqJX374XbEeIOwL4GBfQ", name: "A Saga dos X-Men - Volume 34.cbr" },
-    { id: "1OmPcCRhBjnNOxosHAUtW6RMOzKRyZRXG", name: "A Saga dos X-Men - Volume 35.cbz" },
-    { id: "1Go7Yvi7EG7nc6GjprSk-v5zDLq67WzA5", name: "A Saga dos X-Men - Volume 36 (FIM DE FASE).cbz" }
+    { id: "10ey57BLxTm84LB-uoS3T0xQb8ZEW_NAf", name: "A Saga dos X-Men - Volume 01.cbr", size: 258360618 },
+    { id: "1a_bFx3S-8EQppRtkBs1kXvmkYdmHbwZJ", name: "A Saga dos X-Men - Volume 02.cbr", size: 270531087 },
+    { id: "1onWLbKEL80zDKMZTLQbfKC13lysDNQfL", name: "A Saga dos X-Men - Volume 03.cbr", size: 300720520 },
+    { id: "1DitL6mpLRvYV1eSQJMAM5uSq8VfJ4kib", name: "A Saga dos X-Men - Volume 04.cbr", size: 284106597 },
+    { id: "1stBpGLBCTbwfvhOmR2DV3NWgblPnkfLh", name: "A Saga dos X-Men - Volume 05.cbr", size: 259026357 },
+    { id: "179X5fzCsbZG33HuMfU8ocoUoWnghV6dy", name: "A Saga dos X-Men - Volume 06.cbr", size: 288728534 },
+    { id: "1SsMTBXcRMsmrRa7Ozw1spWmHQiiZNxYy", name: "A Saga dos X-Men - Volume 07.cbr", size: 290204350 },
+    { id: "1RIAT5cNpRgwCrLafpk39Oo25hcHeIDv4", name: "A Saga dos X-Men - Volume 08.cbr", size: 281065716 },
+    { id: "1yZaXtDpAZorKhx4ywOt7PkBoXtX5kOTu", name: "A Saga dos X-Men - Volume 09.cbr", size: 284187860 },
+    { id: "1eor0kLLnEOhElfnkP-RLHmaY-bGGsTU6", name: "A Saga dos X-Men - Volume 10.cbr", size: 272840268 },
+    { id: "1y3vJCqAnav4DmFQoZiKjN0tlxUWgSOgx", name: "A Saga dos X-Men - Volume 11.cbr", size: 308780859 },
+    { id: "1OR_ZKDc1fsXe2kXv_L2FiZHScN5AC_JE", name: "A Saga dos X-Men - Volume 12.cbr", size: 271532127 },
+    { id: "1KmMd2EcYuUy0_77b0jo0KOWr9NTCnUWa", name: "A Saga dos X-Men - Volume 13.cbr", size: 274652542 },
+    { id: "1K7oJRAV49n_I1nwtD9YRVkuKAdtwlF3w", name: "A Saga dos X-Men - Volume 14.cbr", size: 339083420 },
+    { id: "1yS8j64OGdB7IAWHt5v41OF3yGB9_kztZ", name: "A Saga dos X-Men - Volume 15.cbr", size: 310154028 },
+    { id: "1smSbhPNGA9VrYyImrqQHhzbyEzlxT0-9", name: "A Saga dos X-Men - Volume 16.cbr", size: 289217029 },
+    { id: "1Xi7YGZ9xD8SGqJ-gBqdBZrTJJgvrGK_x", name: "A Saga dos X-Men - Volume 17.cbr", size: 195268251 },
+    { id: "1vb8gXQZVME2FSYqTdQl0WiHNR8G5zKXe", name: "A Saga dos X-Men - Volume 18.cbr", size: 216990226 },
+    { id: "1I8Jc368vkyAq9X_ytx8yGjwWxA7R1w0L", name: "A Saga dos X-Men - Volume 19.cbr", size: 197007358 },
+    { id: "1PlJBbANrjhw6-5kIbgtzSO3BQVxVQzdr", name: "A Saga dos X-Men - Volume 20.cbr", size: 212742406 },
+    { id: "11lTKW5pPyRdV5xUxXoVZElVpDo1fSwAK", name: "A Saga dos X-Men - Volume 21.cbr", size: 208086273 },
+    { id: "1abKCrgsnthKZA0DffWGme22Upmwxkyy3", name: "A Saga dos X-Men - Volume 22.cbr", size: 198400991 },
+    { id: "1F7AiZ3ZQl0dQnqD-bMdr-Y0kw0ih1P1o", name: "A Saga dos X-Men - Volume 23.cbr", size: 196360008 },
+    { id: "1sUL7qINSUHp4RGnS6v8WO_5RFZOf-AeP", name: "A Saga dos X-Men - Volume 24.cbr", size: 196036961 },
+    { id: "1TEXaGs1bgSqZZr8yrraugnuq2ShVsiCH", name: "A Saga dos X-Men - Volume 25.cbr", size: 210314913 },
+    { id: "1RubE6btbLa5H9GMKtzHVUCOQ_V7403BV", name: "A Saga dos X-Men - Volume 26.cbr", size: 192170544 },
+    { id: "1NG54k58l1yQ6Xq8fYGVuzZxGntfIXZ1g", name: "A Saga dos X-Men - Volume 27.cbr", size: 166029078 },
+    { id: "1CK48vIV7jraqa6E2KbXe9G7CXblnPeuW", name: "A Saga dos X-Men - Volume 28.cbr", size: 194811141 },
+    { id: "1m8f2cFW3nAa73ixjLasev_IGrr80wSSn", name: "A Saga dos X-Men - Volume 29.cbr", size: 189530506 },
+    { id: "1XMaLLiUixgxsOWhlBqP7Jz0Js1OsK2sp", name: "A Saga dos X-Men - Volume 30.cbr", size: 194784686 },
+    { id: "14wc9oi-vU2Q6w-jcN4M_x0PoGIxmtXYS", name: "A Saga dos X-Men - Volume 31.cbr", size: 206510002 },
+    { id: "1dJZyzrdM_W_PLrqZDVy_NmqOKuqtCvys", name: "A Saga dos X-Men - Volume 32.cbr", size: 199227053 },
+    { id: "1vh_U86hDHOl3dVRkdIkTGqEb8dvSjl_h", name: "A Saga dos X-Men - Volume 33.cbr", size: 198783755 },
+    { id: "1hawLaVt2wqUEaqJX374XbEeIOwL4GBfQ", name: "A Saga dos X-Men - Volume 34.cbr", size: 199947428 },
+    { id: "1OmPcCRhBjnNOxosHAUtW6RMOzKRyZRXG", name: "A Saga dos X-Men - Volume 35.cbz", size: 263785911 },
+    { id: "1Go7Yvi7EG7nc6GjprSk-v5zDLq67WzA5", name: "A Saga dos X-Men - Volume 36 (FIM DE FASE).cbz", size: 262564357 }
+];
+const R2_DEMOLIDOR_ITEMS = [
+    { id: "1VKe7uB6BjaK6Vy3ANJ5JzH7FcjKuynSE", name: "Demolidor - Terra das Sombras.cbr", size: 346404659 },
+    { id: "1kb3cCEFTrdjBO7YLjlfEWWu6BGGy6yRd", name: "Marvel Essenciais - Demolidor - Pai.cbr", size: 214806099 },
+    { id: "18R5QPi3jIgbeo77Gq0HlWrSRPaLiDD_t", name: "Marvel Vintage - Demolidor - Fim dos Dias.cbr", size: 233172757 }
 ];
 const R2_CATALOG_CACHE_TTL_MS = 30000;
 const R2_CATALOG_UPDATE_MEMO_TTL_MS = 30000;
@@ -2140,6 +2145,7 @@ async function listSharedRecentAddedIds(env, force = false) {
         pages++;
         if (pages > Math.ceil(SHARED_RECENT_ADDED_MAX_IDS / 1000) + 1) throw new Error("A paginação do histórico compartilhado excedeu o limite seguro.");
     } while (cursor);
+    for (const item of R2_DEMOLIDOR_ITEMS) ids.add(item.id);
     const result = [...ids].sort();
     sharedRecentAddedMemo = { expiresAt: now + SHARED_RECENT_ADDED_MEMO_TTL_MS, ids: result };
     return result.slice();
@@ -2229,15 +2235,29 @@ async function handleDriveList(url, env, ctx) {
                 // returns no children or the main index is stale. This does not
                 // create a ficha or bypass the app's existing ficha filter.
                 if (parentMatch[1] === R2_CATALOG_ROOT_ID) {
-                    const id = R2_SAGA_XMEN_FOLDER_ID;
-                    const current = merged.get(id) || {};
-                    merged.set(id, {
-                        ...current,
-                        id,
-                        name: "A Saga dos X-Men",
-                        mimeType: "application/vnd.google-apps.folder",
-                        parents: [...new Set([...(Array.isArray(current.parents) ? current.parents : []), R2_CATALOG_ROOT_ID])]
-                    });
+                    const specialFolders = [
+                        { id: R2_SAGA_XMEN_FOLDER_ID, name: "A Saga dos X-Men" },
+                        { id: R2_DEMOLIDOR_FOLDER_ID, name: "Coleção: Demolidor" }
+                    ];
+                    for (const folder of specialFolders) {
+                        const current = merged.get(folder.id) || {};
+                        merged.set(folder.id, {
+                            ...current,
+                            ...folder,
+                            mimeType: "application/vnd.google-apps.folder",
+                            parents: [...new Set([...(Array.isArray(current.parents) ? current.parents : []), R2_CATALOG_ROOT_ID])]
+                        });
+                    }
+                } else if (parentMatch[1] === R2_DEMOLIDOR_FOLDER_ID) {
+                    for (const row of R2_DEMOLIDOR_ITEMS) {
+                        const current = merged.get(row.id) || {};
+                        merged.set(row.id, {
+                            ...current,
+                            ...row,
+                            mimeType: current.mimeType || "application/x-cbr",
+                            parents: [...new Set([...(Array.isArray(current.parents) ? current.parents : []), R2_DEMOLIDOR_FOLDER_ID])]
+                        });
+                    }
                 } else if (parentMatch[1] === R2_SAGA_XMEN_FOLDER_ID) {
                     for (const row of R2_SAGA_XMEN_ITEMS) {
                         const current = merged.get(row.id) || {};
@@ -2253,9 +2273,9 @@ async function handleDriveList(url, env, ctx) {
                 items = [...merged.values()];
             // R2-first: combine the indexed catalogue with the live folder contents.
             // In this mode the live Drive response is authoritative for the folder.
-            // Do not list catalog/updates/<folder>/ and GET every update on every
-            // folder request: that turns a library crawl into R2 Class A + B fan-out.
-            // R2-only still merges persisted updates below because Drive is disabled.
+            // When Drive returns no children, use the incremental records scoped to
+            // this parent so private folders can still reveal newly warmed items.
+            // R2-only merges those records regardless of the live Drive state.
             const r2Only = await isR2OnlyMode(env);
             if (r2Only) {
                 const parentUpdates = await loadCatalogMetadataUpdates(env, parentMatch[1]);
@@ -2293,11 +2313,12 @@ async function handleDriveList(url, env, ctx) {
                     // New/changed files remain visible from the live Drive listing.
                     // Catalog metadata is published by the explicit admin warm/index
                     // flows, not by HEAD-checking every comic during normal app reads.
-                } else if (!liveOk || merged.size === 0) {
-                    // Drive failed or returned no visible children for a parent
-                    // missing from the main index. Read incremental metadata only
-                    // in those cases; do not add LIST/GET fan-out for every private
-                    // folder whose children are already present in catalog/index.
+                } else if (!liveOk || liveItems.length === 0) {
+                    // A successful empty Drive response is not authoritative: it
+                    // can mean the folder is private. Consult this parent's
+                    // incremental metadata, which is where newly warmed items
+                    // absent from catalog/index.json are recorded. This is scoped
+                    // to the requested parent and is memoized for 30 seconds.
                     const parentUpdates = await loadCatalogMetadataUpdates(env, parentMatch[1]);
                     for (const item of parentUpdates) mergeCatalogUpdateIfNewer(merged, item);
                     items = [...merged.values()];
