@@ -2343,6 +2343,20 @@ async function handleDriveList(url, env, ctx) {
             items = [...merged.values()].filter(item => String(item.name || "").toLocaleLowerCase().includes(needle));
         }
     } catch (e) { return json(500, { error: "Falha ao mesclar atualizações incrementais do catálogo: " + String(e) }); }
+    if (parentMatch && parentMatch[1] === R2_CATALOG_ROOT_ID) {
+        const sagaName = value => String(value || "")
+            .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+            .toLocaleLowerCase("pt-BR").replace(/[^a-z0-9]+/g, " ").trim()
+            .replace(/^a\s+/, "");
+        const canonicalSagaName = sagaName("A Saga dos X-Men");
+        // Drive/R2 may contain an older empty folder with the same display name.
+        // Keep the canonical folder ID whose listing is backed by the 36 known
+        // warmed volumes; discard only duplicate folder rows, never any files.
+        items = items.filter(item => {
+            const isFolder = item?.mimeType === "application/vnd.google-apps.folder" || item?.isFolder === true;
+            return !isFolder || sagaName(item.name) !== canonicalSagaName || item.id === R2_SAGA_XMEN_FOLDER_ID;
+        });
+    }
     let offset = 0;
     if (pageToken) {
         const match = /^r2:(\d+)$/.exec(pageToken);
