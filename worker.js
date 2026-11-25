@@ -2180,18 +2180,21 @@ async function handleSharedRecentAdded(request, env) {
             const existing = new Set(existingIds);
             const additions = new Set([...rootIds, ...knownIds]);
             for (const id of additions) if (!libraryIds.has(id)) additions.delete(id);
-            const removals = existingIds.filter(id => !libraryIds.has(id));
             const writes = [...additions].filter(id => !existing.has(id));
             try {
                 await Promise.all(writes.map(id => env.ACCESS_CODES.put(`${SHARED_RECENT_ADDED_PREFIX}${id}`, "1")));
-                await Promise.all(removals.map(id => env.ACCESS_CODES.delete(`${SHARED_RECENT_ADDED_PREFIX}${id}`)));
             } catch (error) {
                 sharedRecentAddedMemo = { expiresAt: 0, ids: null };
                 throw error;
             }
-            const next = [...new Set([...existingIds.filter(id => libraryIds.has(id)), ...additions])].sort();
+            // A Drive scan can return HTTP 200 with a partial/empty list when a
+            // folder becomes private. Absence from one client's snapshot is not
+            // proof that a comic left the library, so never delete shared history
+            // from this synchronization path. The app displays an ID only while
+            // its R2/Drive catalogue still supplies the comic record.
+            const next = [...new Set([...existingIds, ...additions])].sort();
             sharedRecentAddedMemo = { expiresAt: Date.now() + SHARED_RECENT_ADDED_MEMO_TTL_MS, ids: next };
-            return json(200, { ids: next, added: writes.length, removed: removals.length });
+            return json(200, { ids: next, added: writes.length, removed: 0 });
         };
         const operation = sharedRecentAddedMutationQueue.then(mutate, mutate);
         sharedRecentAddedMutationQueue = operation.catch(() => {});
@@ -2221,6 +2224,32 @@ async function handleDriveList(url, env, ctx) {
             if (parentMatch) {
                 const merged = new Map();
                 for (const item of catalog.byParent.get(parentMatch[1]) || []) mergeCatalogUpdateIfNewer(merged, item);
+                // These warmed objects are a known, verified R2 collection. Keep
+                // its directory listing available even if the live Drive query
+                // returns no children or the main index is stale. This does not
+                // create a ficha or bypass the app's existing ficha filter.
+                if (parentMatch[1] === R2_CATALOG_ROOT_ID) {
+                    const id = R2_SAGA_XMEN_FOLDER_ID;
+                    const current = merged.get(id) || {};
+                    merged.set(id, {
+                        ...current,
+                        id,
+                        name: "A Saga dos X-Men",
+                        mimeType: "application/vnd.google-apps.folder",
+                        parents: [...new Set([...(Array.isArray(current.parents) ? current.parents : []), R2_CATALOG_ROOT_ID])]
+                    });
+                } else if (parentMatch[1] === R2_SAGA_XMEN_FOLDER_ID) {
+                    for (const row of R2_SAGA_XMEN_ITEMS) {
+                        const current = merged.get(row.id) || {};
+                        const inferredMime = /\.cbz$/i.test(row.name) ? "application/x-cbz" : "application/x-cbr";
+                        merged.set(row.id, {
+                            ...current,
+                            ...row,
+                            mimeType: current.mimeType || inferredMime,
+                            parents: [...new Set([...(Array.isArray(current.parents) ? current.parents : []), R2_SAGA_XMEN_FOLDER_ID])]
+                        });
+                    }
+                }
                 items = [...merged.values()];
             // R2-first: combine the indexed catalogue with the live folder contents.
             // In this mode the live Drive response is authoritative for the folder.
@@ -2254,7 +2283,7 @@ async function handleDriveList(url, env, ctx) {
                     if (!drivePageToken) break;
                     if (page === 99) liveOk = false;
                 }
-                    if (liveOk) {
+                    if (liveOk && liveItems.length > 0) {
                     for (const rawItem of liveItems) {
                         const item = normalizeCatalogListingItem(rawItem);
                         if (!item?.id) continue;
@@ -2264,11 +2293,17 @@ async function handleDriveList(url, env, ctx) {
                     // New/changed files remain visible from the live Drive listing.
                     // Catalog metadata is published by the explicit admin warm/index
                     // flows, not by HEAD-checking every comic during normal app reads.
-                } else {
-                    // Drive temporarily unavailable: preserve the previous fallback
-                    // behavior and read persisted incremental metadata from R2.
+                } else if (!liveOk || merged.size === 0) {
+                    // Drive failed or returned no visible children for a parent
+                    // missing from the main index. Read incremental metadata only
+                    // in those cases; do not add LIST/GET fan-out for every private
+                    // folder whose children are already present in catalog/index.
                     const parentUpdates = await loadCatalogMetadataUpdates(env, parentMatch[1]);
                     for (const item of parentUpdates) mergeCatalogUpdateIfNewer(merged, item);
+                    items = [...merged.values()];
+                } else {
+                    // Empty live result, but the main R2 index already contains the
+                    // children; serve that snapshot without further R2 operations.
                     items = [...merged.values()];
                 }
             } else {
