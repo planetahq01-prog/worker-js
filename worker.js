@@ -1243,6 +1243,34 @@ function requireAdminToken(request, env) {
     if (!given || !safeEqual(given, env.ADMIN_TOKEN)) return json(401, "ADMIN_TOKEN incorreto ou ausente.");
     return null;
 }
+const SAGA_XMEN_DETAIL_CLEANUP_MARKER = "detail-meta-migration:saga-xmen-title-v1";
+function normalizeFichaTitle(value) {
+    return String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+        .toLocaleLowerCase("pt-BR").replace(/[^a-z0-9]+/g, " ").trim().replace(/^a\s+/, "");
+}
+async function removeSagaXmenDetailRecordsOnce(env) {
+    if (await env.ACCESS_CODES.get(SAGA_XMEN_DETAIL_CLEANUP_MARKER)) return;
+    let cursor;
+    const matchingKeys = [];
+    do {
+        const listing = await env.ACCESS_CODES.list({ prefix: "detail-meta:", limit: 1000, cursor });
+        const rows = await Promise.all((listing.keys || []).map(async key => {
+            const raw = await env.ACCESS_CODES.get(key.name);
+            if (!raw) return null;
+            try { return { key: key.name, metadata: JSON.parse(raw) }; } catch (_) { return null; }
+        }));
+        for (const row of rows) {
+            if (!row || !row.metadata || typeof row.metadata !== "object") continue;
+            const titles = [row.metadata.displayTitle, row.metadata.title, row.metadata.name, row.metadata.folderName, row.metadata.collectionName];
+            if (titles.some(title => normalizeFichaTitle(title) === "saga dos x men")) matchingKeys.push(row.key);
+        }
+        cursor = listing.list_complete ? undefined : listing.cursor;
+    } while (cursor);
+    if (matchingKeys.length) await Promise.all(matchingKeys.map(key => env.ACCESS_CODES.delete(key)));
+    // Mark only after the entire scan and deletion succeeded. New ficha edits
+    // made after this one-time cleanup will not be removed by subsequent loads.
+    await env.ACCESS_CODES.put(SAGA_XMEN_DETAIL_CLEANUP_MARKER, JSON.stringify({ removed: matchingKeys.length, completedAt: new Date().toISOString() }));
+}
 async function handlePublicDetailMetadata(env, url) {
     try {
         const requestedIds = url ? [...new Set([
@@ -1257,6 +1285,7 @@ async function handlePublicDetailMetadata(env, url) {
             }));
             return new Response(JSON.stringify({ items }), { headers: { ...corsHeaders(), "Content-Type": "application/json", "Cache-Control": "no-store" } });
         }
+        await removeSagaXmenDetailRecordsOnce(env);
         let cursor;
         do {
             const listing = await env.ACCESS_CODES.list({ prefix: "detail-meta:", limit: 1000, cursor });
